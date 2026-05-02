@@ -1,15 +1,8 @@
 """Git connector daemon: pulls a remote repo and mirrors batches into pending/.
 
-Read-only on the repo: pulls (clone / fetch + reset --hard); never adds, modifies,
-deletes, or commits anything. The repo is the publisher's territory.
-
-Atomic copy: write `<id>.json.tmp`, then `os.replace`. On NTFS within one volume
-this is atomic, so the cycle's `glob("*.json")` never sees a partial file.
-
-Mirror semantics (not import-once): every pass re-syncs `active_order/<batch_id>.json`
-into `pending/<batch_id>.json` if the bytes differ — supporting in-place edits to
-mutable fields (currently only `expires_at`). Batches already in finished/expired/failed
-are never re-imported — the cycle owns the terminal verdict.
+Read-only on the repo. Mirror semantics: every pass re-syncs `active_order/<id>.json`
+into `pending/<id>.json` when bytes differ, modulo the skip rules in CONNECTOR.md.
+Atomic via `<id>.json.tmp` + `os.replace`. Terminal batches are never re-imported.
 """
 
 import json
@@ -119,17 +112,7 @@ def connector_loop() -> None:
 
 
 def _import_pass() -> None:
-    """Mirror publisher's active_order/ into pending/.
-
-    Identity is `batch_id`, which hashes only `orders` — so the publisher may
-    edit `expires_at` (and only by *reducing* it; see CONNECTOR.md). The pass
-    treats the publisher's content as truth for any batch not already finalized:
-    identical bytes ⇒ no-op, different bytes ⇒ atomic overwrite.
-
-    Held under `batch_state_lock` per file so the cycle's `move_pair` / `move_invalid`
-    cannot interleave between the terminal-set check and the copy — eliminating
-    the "phantom resurrection" race.
-    """
+    """Mirror publisher's active_order/ into pending/. Skip rules: see CONNECTOR.md."""
     now = int(time.time())
     src_dir = config.GIT_LOCAL_DIR / _ACTIVE_ORDER_DIRNAME
     if not src_dir.exists():

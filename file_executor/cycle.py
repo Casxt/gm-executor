@@ -48,10 +48,9 @@ def run_cycle() -> None:
         log.warning("skipping cycle: trade channel down")
         return
 
-    # Held for the whole cycle: freeze pending/ against connector mirrors and
-    # against callback-driven path lookups for the duration of one reconcile.
-    # The lock is reentrant, so order_log.append / move_pair / replay_record
-    # below re-acquire it without contention.
+    # Held for the whole cycle so connector mirrors and callback-driven path
+    # lookups can't interleave with reconcile. Reentrant — order_log helpers
+    # re-acquire freely.
     with state.batch_state_lock:
         now = unix_now()
         positions, unfinished = _broker_snapshot()
