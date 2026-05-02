@@ -8,8 +8,9 @@ cycle reconciles whatever is now true.
 import logging
 import time
 from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from gm.api import (
     OrderSide_Buy,
@@ -39,6 +40,22 @@ def unix_now() -> int:
 
 def unix_now_ms() -> int:
     return int(time.time() * 1000)
+
+
+@contextmanager
+def timed(name: str) -> Iterator[dict[str, Any]]:
+    """Log `gm_api: <name> took=<ms> [field=value ...]` on exit.
+
+    Mutate the yielded dict to attach per-call fields (e.g. result count).
+    """
+    fields: dict[str, Any] = {}
+    t0 = time.perf_counter()
+    try:
+        yield fields
+    finally:
+        ms = (time.perf_counter() - t0) * 1000
+        extras = " " + " ".join(f"{k}={v}" for k, v in fields.items()) if fields else ""
+        log.info("gm_api: %s took=%.1fms%s", name, ms, extras)
 
 
 # ── cycle entry point ─────────────────────────────────────────────────
@@ -171,20 +188,21 @@ def _submit(batch_id: str, order_id: str, symbol: str, diff: int,
     log.info("submit: batch=%s symbol=%s vol=%d side=%s type=%s price=%s",
              batch_id, symbol, volume, side_text, order_type_str, submit_price)
 
-    results = order_volume(
-        symbol=symbol, volume=volume,
-        side=side, order_type=order_type,
-        position_effect=PositionEffect_Open, price=submit_price,
-    ) or []
+    with timed("order_volume") as f:
+        results = order_volume(
+            symbol=symbol, volume=volume,
+            side=side, order_type=order_type,
+            position_effect=PositionEffect_Open, price=submit_price,
+        ) or []
+        f["returned"] = len(results)
+        f["batch"]    = batch_id
+        f["order"]    = order_id
 
     if not results:
         log.error("order_volume returned no orders for batch=%s order=%s symbol=%s — "
                   "broker may still place the order, but we cannot track it",
                   batch_id, order_id, symbol)
         return
-
-    log.info("order_volume returned %d order(s) for batch=%s order=%s",
-             len(results), batch_id, order_id)
 
     for r in results:
         cl_ord_id = getattr(r, "cl_ord_id", None)
@@ -231,10 +249,13 @@ def _cancel_alive(batch_id: str, unfinished: dict[str, list]) -> None:
     if not ours:
         return
 
-    try:
-        order_cancel(ours)
-    except Exception:
-        log.exception("order_cancel failed for batch %s", batch_id)
+    with timed("order_cancel") as f:
+        f["n"]     = len(ours)
+        f["batch"] = batch_id
+        try:
+            order_cancel(ours)
+        except Exception:
+            log.exception("order_cancel failed for batch %s", batch_id)
 
     for o in ours:
         order_log.append(batch_id, {
@@ -247,12 +268,20 @@ def _cancel_alive(batch_id: str, unfinished: dict[str, list]) -> None:
 # ── shared bits ───────────────────────────────────────────────────────
 
 def _broker_snapshot() -> tuple[dict[tuple[str, int], int], dict[str, list]]:
+    with timed("get_position") as f:
+        raw_positions = get_position() or []
+        f["n"] = len(raw_positions)
+
     positions: dict[tuple[str, int], int] = {}
-    for p in get_position() or []:
+    for p in raw_positions:
         positions[(p.symbol, int(p.side))] = int(p.volume)
 
+    with timed("get_unfinished_orders") as f:
+        raw_unfinished = get_unfinished_orders() or []
+        f["n"] = len(raw_unfinished)
+
     unfinished: dict[str, list] = defaultdict(list)
-    for o in get_unfinished_orders() or []:
+    for o in raw_unfinished:
         unfinished[o.symbol].append(o)
     return positions, unfinished
 
