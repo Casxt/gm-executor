@@ -87,28 +87,23 @@ def _peek_batch(path: Path) -> tuple[str, int, int]:
 
 # ── loop ──────────────────────────────────────────────────────────────
 
+def _one_pass() -> None:
+    try:
+        _sync_repo()
+    except subprocess.CalledProcessError as e:
+        log.error("git sync rc=%d: %s", e.returncode, (e.stderr or "").strip()[:200])
+    except Exception:
+        log.exception("git sync failed")
+
+    try:
+        _import_pass()
+    except Exception:
+        log.exception("connector import pass failed")
+
+
 def connector_loop() -> None:
-    if not config.GIT_REPO_URL:
-        log.warning("GMX_GIT_REPO_URL not set; connector exits")
-        return
-    if shutil.which("git") is None:
-        log.error("git not on PATH; connector exits")
-        return
-
-    while not state.stop_event.is_set():
-        try:
-            _sync_repo()
-        except subprocess.CalledProcessError as e:
-            log.error("git sync rc=%d: %s", e.returncode, (e.stderr or "").strip()[:200])
-        except Exception:
-            log.exception("git sync failed")
-
-        try:
-            _import_pass()
-        except Exception:
-            log.exception("connector import pass failed")
-
-        state.stop_event.wait(config.GIT_PULL_SECONDS)
+    while not state.stop_event.wait(config.GIT_PULL_SECONDS):
+        _one_pass()
 
 
 def _import_pass() -> None:
@@ -153,6 +148,12 @@ def start() -> threading.Thread | None:
     if not config.GIT_REPO_URL:
         log.warning("GMX_GIT_REPO_URL not set; connector exits")
         return None
+    if shutil.which("git") is None:
+        log.error("git not on PATH; connector exits")
+        return None
+
+    _one_pass()                                       # synchronous: cycle's first tick sees a populated pending/
+
     t = threading.Thread(target=connector_loop, name="connector", daemon=True)
     t.start()
     state.worker_threads.append(t)

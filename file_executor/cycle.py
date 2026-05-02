@@ -17,6 +17,7 @@ from gm.api import (
     OrderSide_Sell,
     OrderType_Limit,
     OrderType_Market,
+    PositionEffect_Close,
     PositionEffect_Open,
     PositionSide_Long,
     get_position,
@@ -179,8 +180,10 @@ def _handle_unfinished(symbol: str, sym_unfinished: list, own_cl_ord_ids: set[st
 
 def _submit(batch_id: str, order_id: str, symbol: str, diff: int,
             order_type_str: str, price: float | None) -> None:
-    side       = OrderSide_Buy if diff > 0 else OrderSide_Sell
-    side_text  = "buy"         if diff > 0 else "sell"
+    buy        = diff > 0
+    side       = OrderSide_Buy        if buy else OrderSide_Sell
+    side_text  = "buy"                if buy else "sell"
+    pos_effect = PositionEffect_Open  if buy else PositionEffect_Close   # A-shares: sell-with-Open is interpreted as shorting and rejected ("A股不允许做空")
     order_type = OrderType_Limit if order_type_str == "limit" else OrderType_Market
     submit_price = float(price) if order_type_str == "limit" and price is not None else 0.0
     volume = abs(diff)
@@ -192,7 +195,7 @@ def _submit(batch_id: str, order_id: str, symbol: str, diff: int,
         results = order_volume(
             symbol=symbol, volume=volume,
             side=side, order_type=order_type,
-            position_effect=PositionEffect_Open, price=submit_price,
+            position_effect=pos_effect, price=submit_price,
         ) or []
         f["returned"] = len(results)
         f["batch"]    = batch_id

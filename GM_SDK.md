@@ -85,7 +85,7 @@ The only order-placement function gm-executor calls. Diff is computed by us, so 
 | `volume`          | int   | share count.**Stocks: ≥100 to buy, ≥1 to sell.** Broker rounds down (`向下取整`); we still send integer lots                                                                 |
 | `side`            | int   | `OrderSide_Buy = 1` / `OrderSide_Sell = 2`                                                                                                                                         |
 | `order_type`      | int   | `OrderType_Limit = 1` / `OrderType_Market = 2`                                                                                                                                     |
-| `position_effect` | int   | A-shares: always `PositionEffect_Open = 1` (broker derives close from side). Futures uses the full matrix — we never hit that path                                                  |
+| `position_effect` | int   | A-shares: `PositionEffect_Open = 1` for buys, `PositionEffect_Close = 2` for sells. Sell-with-`Open` is rejected as `A股不允许做空` (broker treats it as opening a short)             |
 | `price`           | float | limit price when `order_type=Limit`. **For SHSE market orders this is the protection price** and is required (buy: ≤涨停; sell: ≥跌停). 2 decimals for stocks. Default `0` |
 | `trigger_type`    | int   | futures conditional trigger kind. Default `0` (non-conditional). **Unused — A-shares**                                                                                        |
 | `stop_price`      | float | futures conditional trigger price. Default `0`. **Unused**                                                                                                                     |
@@ -107,7 +107,7 @@ Pass a single `Order` or a list. Available for ad-hoc operator use; gm-executor'
 | ------------------ | ------------------------------------------------------------------------------------------------- |
 | `OrderSide`      | `Buy=1`, `Sell=2`                                                                             |
 | `OrderType`      | `Limit=1`, `Market=2`                                                                         |
-| `PositionEffect` | `Open=1`, `Close=2`, `CloseToday=3`, `CloseYesterday=4` (only `Open` used for A-shares) |
+| `PositionEffect` | `Open=1`, `Close=2`, `CloseToday=3`, `CloseYesterday=4` (A-shares: `Open` for buy, `Close` for sell; `CloseToday`/`CloseYesterday` are futures-only) |
 | `PositionSide`   | `Long=1`, `Short=2`                                                                           |
 
 ### `OrderStatus` (lifecycle of one `cl_ord_id`)
