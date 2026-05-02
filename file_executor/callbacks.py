@@ -11,6 +11,23 @@ import logging
 from gm.api import (
     ExecType_CancelRejected,
     ExecType_Trade,
+    OrderRejectReason_AccountDisabled,
+    OrderRejectReason_AccountDisconnected,
+    OrderRejectReason_AccountLoggedout,
+    OrderRejectReason_IllegalAccountId,
+    OrderRejectReason_IllegalPrice,
+    OrderRejectReason_IllegalStrategyId,
+    OrderRejectReason_IllegalSymbol,
+    OrderRejectReason_IllegalVolume,
+    OrderRejectReason_Internal,
+    OrderRejectReason_NoEnoughCash,
+    OrderRejectReason_NoEnoughPosition,
+    OrderRejectReason_NotInTradingSession,
+    OrderRejectReason_OrderTypeNotSupported,
+    OrderRejectReason_RiskRuleCheckFailed,
+    OrderRejectReason_SymbolSusppended,
+    OrderRejectReason_Throttle,
+    OrderRejectReason_Unknown,
     OrderSide_Buy,
     OrderStatus_Canceled,
     OrderStatus_Expired,
@@ -52,16 +69,21 @@ def on_order_status(context, order) -> None:
             log.warning("status for unknown cl_ord_id=%s symbol=%s status=%d (%s); dropping",
                         cl_ord_id, symbol, status, status_text)
             return
-        order_log.append(batch_id, {
-            "ts_ms":          unix_now_ms(),
-            "event":          "status",
-            "cl_ord_id":      cl_ord_id,
-            "symbol":         symbol,
-            "status":         status,
-            "status_text":    status_text,
-            "filled_volume":  int(order.filled_volume or 0),
-            "ord_rej_reason": int(getattr(order, "ord_rej_reason", 0) or 0),
-        })
+        ev: dict = {
+            "ts_ms":         unix_now_ms(),
+            "event":         "status",
+            "cl_ord_id":     cl_ord_id,
+            "symbol":        symbol,
+            "status":        status,
+            "status_text":   status_text,
+            "filled_volume": int(order.filled_volume or 0),
+        }
+        if status == OrderStatus_Rejected:
+            reason = int(getattr(order, "ord_rej_reason", 0) or 0)
+            ev["ord_rej_reason"]        = reason
+            ev["ord_rej_reason_text"]   = _REJ_REASON_TEXTS.get(reason, f"Reason{reason}")
+            ev["ord_rej_reason_detail"] = getattr(order, "ord_rej_reason_detail", "") or ""
+        order_log.append(batch_id, ev)
     except Exception:
         log.exception("on_order_status failed")
 
@@ -96,7 +118,9 @@ def on_execution_report(context, execrpt) -> None:
             ev["price"]     = float(execrpt.price)
             ev["amount"]    = float(execrpt.amount)
         elif exec_type == ExecType_CancelRejected:
-            ev["ord_rej_reason"]        = int(getattr(execrpt, "ord_rej_reason", 0) or 0)
+            reason = int(getattr(execrpt, "ord_rej_reason", 0) or 0)
+            ev["ord_rej_reason"]        = reason
+            ev["ord_rej_reason_text"]   = _REJ_REASON_TEXTS.get(reason, f"Reason{reason}")
             ev["ord_rej_reason_detail"] = getattr(execrpt, "ord_rej_reason_detail", "") or ""
 
         order_log.append(batch_id, ev)
@@ -185,6 +209,27 @@ _STATUS_TEXTS: dict[int, str] = {
     OrderStatus_Rejected:        "Rejected",
     OrderStatus_PendingNew:      "PendingNew",
     OrderStatus_Expired:         "Expired",
+}
+
+
+_REJ_REASON_TEXTS: dict[int, str] = {
+    OrderRejectReason_Unknown:               "Unknown",
+    OrderRejectReason_RiskRuleCheckFailed:   "RiskRuleCheckFailed",
+    OrderRejectReason_NoEnoughCash:          "NoEnoughCash",
+    OrderRejectReason_NoEnoughPosition:      "NoEnoughPosition",
+    OrderRejectReason_IllegalAccountId:      "IllegalAccountId",
+    OrderRejectReason_IllegalStrategyId:     "IllegalStrategyId",
+    OrderRejectReason_IllegalSymbol:         "IllegalSymbol",
+    OrderRejectReason_IllegalVolume:         "IllegalVolume",
+    OrderRejectReason_IllegalPrice:          "IllegalPrice",
+    OrderRejectReason_AccountDisabled:       "AccountDisabled",
+    OrderRejectReason_AccountDisconnected:   "AccountDisconnected",
+    OrderRejectReason_AccountLoggedout:      "AccountLoggedout",
+    OrderRejectReason_NotInTradingSession:   "NotInTradingSession",
+    OrderRejectReason_OrderTypeNotSupported: "OrderTypeNotSupported",
+    OrderRejectReason_Throttle:              "Throttle",
+    OrderRejectReason_SymbolSusppended:      "SymbolSuspended",
+    OrderRejectReason_Internal:              "Internal",
 }
 
 

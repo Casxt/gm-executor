@@ -180,10 +180,11 @@ def _handle_unfinished(symbol: str, sym_unfinished: list, own_cl_ord_ids: set[st
 
 def _submit(batch_id: str, order_id: str, symbol: str, diff: int,
             order_type_str: str, price: float | None) -> None:
-    buy        = diff > 0
-    side       = OrderSide_Buy        if buy else OrderSide_Sell
-    side_text  = "buy"                if buy else "sell"
-    pos_effect = PositionEffect_Open  if buy else PositionEffect_Close   # A-shares: sell-with-Open is interpreted as shorting and rejected ("A股不允许做空")
+    buy             = diff > 0
+    side            = OrderSide_Buy        if buy else OrderSide_Sell
+    side_text       = "buy"                if buy else "sell"
+    pos_effect      = PositionEffect_Open  if buy else PositionEffect_Close   # A-shares: sell-with-Open is interpreted as shorting and rejected ("A股不允许做空")
+    pos_effect_text = "open"               if buy else "close"
     order_type = OrderType_Limit if order_type_str == "limit" else OrderType_Market
     submit_price = float(price) if order_type_str == "limit" and price is not None else 0.0
     volume = abs(diff)
@@ -215,15 +216,16 @@ def _submit(batch_id: str, order_id: str, symbol: str, diff: int,
         log.info("  registering cl_ord_id=%s for batch=%s order=%s",
                  cl_ord_id, batch_id, order_id)
         order_log.append(batch_id, {
-            "ts_ms":      unix_now_ms(),
-            "event":      "submit",
-            "order_id":   order_id,
-            "symbol":     symbol,
-            "side":       side_text,
-            "volume":     volume,
-            "order_type": order_type_str,
-            "price":      submit_price if order_type_str == "limit" else 0,
-            "cl_ord_id":  cl_ord_id,
+            "ts_ms":           unix_now_ms(),
+            "event":           "submit",
+            "order_id":        order_id,
+            "symbol":          symbol,
+            "side":            side_text,
+            "position_effect": pos_effect_text,
+            "volume":          volume,
+            "order_type":      order_type_str,
+            "price":           submit_price if order_type_str == "limit" else 0,
+            "cl_ord_id":       cl_ord_id,
         }, register_cl_ord_id=cl_ord_id)
 
 
