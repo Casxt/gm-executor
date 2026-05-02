@@ -7,8 +7,10 @@ Concurrency rules from FLOW.md:
   `log_lock`; never the reverse.
 * Readers (`replay_record`) acquire both locks too, briefly, so they always observe a
   consistent file (no path-changes mid-read, no half-written line).
-* `clord_index` is mutated only inside the same `log_lock` section as the corresponding
-  `submit` write — so the in-memory map and the on-disk record advance atomically.
+* `clord_index` is written only by the cycle worker (under `batch_state_lock`) and read only by
+  the `callback-processor` daemon (also under `batch_state_lock`). Events delivered during a cycle
+  sit in the SDK→drain queue until the cycle releases the lock, so the drain always observes a
+  fully-committed `clord_index`. No race, no dropped events for our own orders.
 * `move_pair` only acquires `batch_state_lock`. A slow `fsync` on `log_lock` cannot block it.
 * `batch_state_lock` is reentrant: the cycle worker holds it across the entire
   `run_cycle`, then re-enters here via `append` / `replay_record` / `move_pair`.
@@ -26,7 +28,7 @@ from . import config, state
 log = logging.getLogger(__name__)
 
 clord_index: dict[str, str] = {}
-"""cl_ord_id → batch_id. Reads are dict-atomic; writes happen under `log_lock`."""
+"""cl_ord_id → batch_id. Reads (callbacks) and writes (cycle) both happen under `batch_state_lock`."""
 
 
 # ── filename helpers ──────────────────────────────────────────────────
@@ -55,7 +57,7 @@ def locate_record(batch_id: str) -> Path | None:
 
 # ── append ────────────────────────────────────────────────────────────
 
-def append(batch_id: str, event: dict[str, Any], *, register_cl_ord_id: str | None = None) -> None:
+def append(batch_id: str, event: dict[str, Any]) -> None:
     """Append one JSONL line to a batch's record.
 
     The first line is always a `submit` written by the cycle thread; that call also
@@ -75,8 +77,6 @@ def append(batch_id: str, event: dict[str, Any], *, register_cl_ord_id: str | No
             path.parent.mkdir(parents=True, exist_ok=True)
 
         with state.log_lock:
-            if register_cl_ord_id is not None:
-                clord_index[register_cl_ord_id] = batch_id   # register BEFORE fsync — callbacks racing on this id otherwise miss for ~8ms (fsync wall time)
             with open(path, "a", encoding="utf-8") as f:
                 f.write(line)
                 f.flush()

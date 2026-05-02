@@ -1,335 +1,163 @@
 # Execution Flow
 
-Run by `gm.api.run(mode=MODE_LIVE, ...)`. The SDK's `timer(...)` ([GM\_SDK.md](./GM_SDK.md)) fires every `GMX_POLL_SECONDS`. Each fire is one **cycle**: scan `pending/`, retire expired/invalid batches, reconcile the single active batch (at most one).
+`gm.api.run()` hosts the strategy. Its `timer(...)` fires every `GMX_POLL_SECONDS`; each fire is one **cycle** that scans `pending/`, retires expired/invalid batches, and reconciles the single active batch.
 
-* Batch schema: [SCHEMA.md](./SCHEMA.md)
-* Per-batch order log: [ORDER\_RECORD.md](./ORDER_RECORD.md)
+* Schema: [SCHEMA.md](./SCHEMA.md)
+* Per-batch log: [ORDER_RECORD.md](./ORDER_RECORD.md)
 
 ## Layout
 
-The orders root is set by **`GMX_ORDERS_DIR`** (default `./orders`). All path references below — `pending/`, `finished/`, `expired/`, `failed/` — are relative to that root. The pseudo-code uses `ORDERS = os.environ.get("GMX_ORDERS_DIR", "./orders")` and joins from there; never hard-code `orders/`.
-
 ```
-$GMX_ORDERS_DIR/
-  pending/    # 0 or 1 active batch + optional not-yet-valid ones
-  finished/   # batch + log, after match
-  expired/    # batch + log, after expires_at; live orders cancelled first
-  failed/     # batch only (no log existed); parse / schema error
+$GMX_ORDERS_DIR/        # default ./orders
+  pending/              # 0 or 1 active batch + future-dated ones
+  finished/             # batch + log, after match
+  expired/              # batch + log, after expires_at; live orders cancelled first
+  failed/               # batch only, parse / schema error
 ```
 
-`<batch_id>.json` is the batch; `<batch_id>.order_record.jsonl` is its sibling JSONL log.
+Per batch: `<batch_id>.json` + `<batch_id>.order_record.jsonl`.
 
 ## Cycle
 
-Two passes. **Pass 1** cleans `pending/`: invalid → `failed/`, expired → `expired/` (after cancelling its live orders). Not-yet-valid batches stay put — they're scheduled work for a future cycle. **Invariant: no two** **`pending/`** **batches have overlapping** **`[valid_at, expires_at]`** **windows.** Violation ⇒ log error + skip the cycle (operator must intervene). **Pass 2** reconciles the (at most one) currently-active batch.
+Two passes. Pass 1 cleans `pending/`; pass 2 reconciles.
 
-```
-ORDERS = os.environ.get("GMX_ORDERS_DIR", "./orders")    # resolved once at startup
-
+```python
 def run_cycle():
     now = unix_now()
+    positions, unfinished = broker_snapshot()           # one call per cycle
 
-    # one broker snapshot per cycle
-    positions  = { (p.symbol, p.side): p.volume for p in get_positions() }
-    unfinished = defaultdict(list)
-    for o in get_unfinished_orders(): unfinished[o.symbol].append(o)
+    seen, active = pass_one(now, unfinished)            # invalid → failed/, expired → expired/+cancel
+    if has_overlap(seen): return                        # invariant: no two pending windows overlap
+    if not active:        return
 
-    # ── pass 1: clean up pending/ ────────────────────────────────────────
-    seen, active = [], []
-    for path in glob(f"{ORDERS}/pending/*.json"):
-        try:    doc = parse_and_validate(path)
-        except: move(path, f"{ORDERS}/failed/"); continue
-
-        if now > doc.expires_at:
-            cancel_alive(doc.batch_id, unfinished)    # cancel this batch's still-open cl_ord_ids
-            move_pair(doc.batch_id, f"{ORDERS}/expired/")
-            continue
-
-        seen.append(doc)
-        if now >= doc.valid_at:
-            active.append(doc)
-        else:
-            log.info(f"scheduled: {doc.batch_id} valid_at={doc.valid_at} now={now}")
-
-    # ── invariant: no two pending batches' [valid_at, expires_at] overlap ─
-    seen.sort(key=lambda d: d.valid_at)
-    for a, b in zip(seen, seen[1:]):
-        if a.expires_at >= b.valid_at:           # a starts no later than b; overlap iff a ends at/after b starts
-            log.error(f"overlap: {a.batch_id} <-> {b.batch_id}; operator must intervene"); return
-
-    if not active:
-        log.info("idle: no active batch"); return
-
-    # ── pass 2: reconcile ────────────────────────────────────────────────
     doc = active[0]
     reconcile(doc, positions, unfinished)
     if matched(doc, positions, unfinished):
-        move_pair(doc.batch_id, f"{ORDERS}/finished/")
+        move_pair(doc.batch_id, FINISHED_DIR)
 ```
 
-`move_pair(batch_id, dst)` moves both `<batch_id>.json` and `<batch_id>.order_record.jsonl` (if present).
+**Pass-1 invariant**: no two `pending/` batches have overlapping `[valid_at, expires_at]` windows. Violation ⇒ skip the cycle (operator must intervene).
 
-## Reconciliation (one batch, per order)
+## Reconciliation
 
-**Rule: any unfinished order on the symbol ⇒ skip the symbol this cycle.** Never cancel-and-resubmit. Just wait.
+Per order, exactly one branch — **never cancel-and-resubmit, just wait**:
 
-For each `order` in `doc.orders`, exactly one branch:
+| `unfinished[symbol]`    | action                                                                     |
+| ----------------------- | -------------------------------------------------------------------------- |
+| empty                   | submit `target − held` if non-zero; else done                              |
+| all `cl_ord_id`s ours   | log info + skip; per stuck entry (`age > 600s`), log error                 |
+| any `cl_ord_id` foreign | log error + skip; operator must intervene                                  |
 
-1. **`unfinished[order.symbol]`** **empty** — `held = positions.get((order.symbol, Long), 0)`; `diff = order.target − held`. If non-zero, call `order_volume(order.symbol, |diff|, Buy if diff>0 else Sell, order.order_type, Open, order.price)` and append a `submit` event.
-2. **Any** **`cl_ord_id`** **NOT in this batch's submit log** — foreign order. `log.error`, skip the symbol.
-3. **All** **`cl_ord_id`s ours** — `log.info`, skip the symbol. Per entry, also `log.error` if `now − created_at > 600s`.
-4. **Exception in 1–3** — `log.exception`, skip the symbol. Next cycle retries.
+Submit is fire-and-forget. The cycle never cancels — `cancel` events come only from pass-1 expiry.
 
-Each symbol is in exactly one state per cycle: empty / ours / foreign. Only empty submits.
+`matched(doc, positions, unfinished)` is true iff every order's held volume equals its target AND no `cl_ord_id` in `unfinished[symbol]` belongs to this batch. Foreign orders don't block matched.
 
-Submit is fire-and-forget. `cancel` events only come from `cancel_alive(...)` during pass 1 expiry; reconciliation never cancels.
+## Threads
 
-## `matched(doc, positions, unfinished)`
+| thread                | owner | what it does                                                              |
+| --------------------- | ----- | ------------------------------------------------------------------------- |
+| main                  | us    | calls `gm.run()`, blocks until shutdown                                   |
+| SDK timer / callbacks | gm    | tiny bodies — set events, snapshot + enqueue                              |
+| `cycle-worker`        | us    | waits on `cycle_pending`, runs `run_cycle()`                              |
+| `connector`           | us    | git pulls + mirror into `pending/` ([CONNECTOR.md](./CONNECTOR.md))       |
+| `callback-processor`  | us    | drains the SDK→drain queue, appends to `order_record.jsonl`               |
+| remote-log relay      | us    | drains queue, POSTs to Feishu ([REMOTE_LOGGING.md](./REMOTE_LOGGING.md))  |
 
-True iff every `order` satisfies:
+Only `cycle-worker` calls trading APIs (`order_volume`, `get_position`, `get_unfinished_orders`) — single-caller by construction.
 
-* `positions.get((order.symbol, Long), 0) == order.target`, and
-* no `cl_ord_id` in `unfinished[order.symbol]` belongs to this batch.
+## Callbacks
 
-Foreign orders don't block matched.
+SDK fires callbacks on its own threads at any moment. Two rules:
 
-## Concurrency
+1. **Snapshot + enqueue, never block.** `on_order_status` and `on_execution_report` copy fields off the SDK object (which the SDK may reuse after return), put a dict on the queue, and return. No locks acquired in the SDK thread.
+2. **Never raise.** An uncaught exception kills the SDK's dispatch loop. Wrap every body in `try / except Exception: log.exception(...)`.
 
-The SDK fires `on_xxx` callbacks on **its own threads**, asynchronously, at any moment — including while a cycle is in progress. Two rules keep this manageable:
+```python
+_event_queue = queue.SimpleQueue()
 
-1. **Callbacks do no real work.** They append one line, set one event, set one flag. A callback that takes more than a few milliseconds risks blocking the SDK's dispatch loop and delaying the next event.
-2. **`run_cycle()` runs on a thread we own**, not on the SDK's timer thread. `on_timer` only signals; a dedicated worker picks up the signal and runs the cycle. This way the timer thread always returns immediately, and a slow cycle never starves event delivery.
+def on_order_status(context, order):
+    try:
+        log.info("recv status: cl_ord_id=%s ...", order.cl_ord_id, ...)
+        _event_queue.put({"kind": "status", "ts_ms": unix_now_ms(), ...})
+    except Exception: log.exception("on_order_status enqueue failed")
 
-### Threads
-
-| thread           | owner | what it does                                                                |
-| ---------------- | ----- | --------------------------------------------------------------------------- |
-| main             | us    | calls `gm.run()`, blocks until shutdown                                     |
-| SDK timer        | gm    | fires `on_timer` → `cycle_pending.set()` → returns                          |
-| SDK callbacks    | gm    | fire `on_order_status`, `on_execution_report`, the connect/disconnect pairs |
-| `cycle_worker`   | us    | waits on `cycle_pending`, runs `run_cycle()`                                |
-| `connector`      | us    | git pulls, copies into `pending/` (see [CONNECTOR.md](./CONNECTOR.md))      |
-| remote-log relay | us    | drains queue, POSTs to Feishu (see [REMOTE_LOGGING.md](./REMOTE_LOGGING.md))|
-
-**Only `cycle_worker` calls trading APIs** (`order_volume`, `get_positions`, `get_unfinished_orders`). Single-caller by construction — no extra serialisation needed for those.
-
-### Locks
-
-* `log_lock` — serialises **writes** to any `order_record.jsonl`.
-* `batch_state_lock` — serialises **everything that observes or changes which directory a batch lives in**: cross-dir moves (`move_pair`, `move_invalid`), path lookups (`locate_record`), the connector's `is_terminal`+`atomic_copy`, and the entire `run_cycle` (cycle holds it for its full duration so no connector edit and no callback-driven path lookup can interleave). Reentrant — the cycle re-acquires it via `order_log` helpers.
-* Lock order: `batch_state_lock` then `log_lock`. Never the reverse.
-
-No `cycle_lock` — only `cycle_worker` runs the cycle, so two cycles can't overlap by construction.
-
-### Wiring
-
-```Python
-stop_event       = threading.Event()
-cycle_pending    = threading.Event()
-log_lock         = threading.Lock()
-batch_state_lock = threading.RLock()
-
-def init(context) -> None:
-    set_token(GM_TOKEN)
-    rebuild_clord_index()
-    threading.Thread(target=cycle_worker, args=(stop_event, cycle_pending),
-                     name="cycle-worker", daemon=True).start()
-    timer(timer_func=on_timer, period=POLL_INTERVAL_MS, start_delay=0)
-
-# ── SDK threads: tiny, never raise ─────────────────────────────────────
-def on_timer(context) -> None:
-    cycle_pending.set()                              # one signal, no work
-
-def on_order_status(context, order) -> None:
-    try:    append_status(order)
-    except Exception: log.exception("on_order_status failed")
-
-def on_execution_report(context, execrpt) -> None:
-    try:    append_trade(execrpt)
-    except Exception: log.exception("on_execution_report failed")
-
-# ── our worker thread ──────────────────────────────────────────────────
-def cycle_worker(stop_event: threading.Event, cycle_pending: threading.Event) -> None:
-    consecutive_failures = 0
-    while not stop_event.is_set():
-        cycle_pending.wait()                         # block until signalled
-        if stop_event.is_set(): return
+def _drain_loop():                                       # callback-processor thread
+    while True:
+        evt = _event_queue.get()
+        if evt is None: return                           # sentinel from stop()
         try:
-            run_cycle()
-            consecutive_failures = 0
-        except Exception:
-            consecutive_failures += 1
-            backoff = min(60, 2 ** consecutive_failures)        # 2, 4, 8, … 60 s
-            log.exception("cycle failed (#%d); backing off %ds", consecutive_failures, backoff)
-            stop_event.wait(backoff)                 # interruptible sleep
-        finally:
-            cycle_pending.clear()                    # drop signals raised during the run
+            with batch_state_lock:                       # serialise behind any in-flight cycle
+                batch_id = clord_index.get(evt["cl_ord_id"])
+                if batch_id is None: warn_foreign(evt); continue
+                order_log.append(batch_id, build_event(evt))
+        except Exception: log.exception("processor failed: %r", evt)
 ```
 
-### Coalescing
+The split decouples SDK dispatch from our locks. Events delivered while a cycle holds `batch_state_lock` sit safely in the queue; the drain processes them after the cycle releases. No event for our own orders is ever lost; "foreign" warnings now genuinely mean "not ours".
 
-`cycle_pending.set()` is idempotent. Any `set()` arriving during a run is wiped by the post-run `clear()` — the cycle in progress already reconciles from authoritative state (broker + filesystem), so re-running immediately would just repeat the same work. The worker only runs again on a fresh signal arriving after `clear()`, which the SDK timer and order-event callbacks reliably produce.
+## Locks
 
-### Recovery
+* `log_lock` — serialises **writes** to any `order_record.jsonl`. Brief: open → write → fsync → close.
+* `batch_state_lock` — serialises **everything that observes or changes which directory a batch lives in**: cross-dir moves, path lookups, the connector's `is_terminal`+`atomic_copy`, the entire `run_cycle`, and every drained callback event. Reentrant — the cycle re-acquires it via `order_log` helpers.
+* Lock order: `batch_state_lock` then `log_lock`. Never reverse.
 
-`run_cycle()` is **stateless across runs**: every cycle reads its inputs from the broker and the filesystem, computes a diff, acts, returns. It owns no state that survives the call. So any exception inside it is just lost work — the next cycle starts fresh and reconciles whatever is now true. Four things make this safe:
+## Routing — `cl_ord_id → batch_id`
 
-* **`try / except Exception`** around `run_cycle()` catches everything that can escape, logs with `exception()` (full traceback), and keeps the loop alive. The next signal triggers a fresh cycle.
-* **`consecutive_failures` counter** — reset on success, incremented on every catch. Used to back off so a persistent failure doesn't spin.
-* **Exponential backoff** capped at 60 s (`2, 4, 8, 16, 32, 60, 60, …`) — slow enough to stop flooding the log when the broker or disk is genuinely down, fast enough that the first transient blip costs only a couple of seconds.
-* **`stop_event.wait(backoff)`** instead of `time.sleep(backoff)` — shutdown wakes the worker immediately even while it's mid-backoff. Never sleep on a non-interruptible primitive inside a worker.
+`clord_index: dict[cl_ord_id, batch_id]`:
 
-All resources held during a cycle — `log_lock`, `batch_state_lock`, file handles — **must** be acquired with `with`. An exception unwinding the stack must release them automatically. Stranding `batch_state_lock` would freeze the connector and every callback that appends to `order_record.jsonl`. The existing `append()` and `replay()` already follow this rule; new I/O paths must too.
+* **Startup** — `rebuild_clord_index()` scans every `*.order_record.jsonl` under live dirs for `submit` lines.
+* **Live** — `cycle-worker` writes the entry inside its `batch_state_lock` section. The drain reads under the same lock, so it always observes a fully-committed index. Miss ⇒ foreign cl_ord_id; warn + drop.
 
-Note what is **not** included: no thread-level supervisor wrapping `cycle_worker`. The worker can only die from a `BaseException` that `except Exception` doesn't catch (`SystemExit`, `KeyboardInterrupt`) — both indicate the process itself is shutting down, and a restarted worker on a dying interpreter would be more harmful than helpful. If a real bug somehow kills the worker, the operator sees cycles stop and restarts the process.
+`locate_record(batch_id)` tries `pending/` → `finished/` → `expired/` and returns the first hit. Caller must hold `batch_state_lock`.
 
-## Log writing
+## Recovery
 
-Three writers (cycle thread + both callbacks). Every append is durable on disk before the locks release — `flush` + `fsync` before close, so a crash right after `append` returns cannot lose the line.
+`run_cycle()` is **stateless across runs**: every cycle reads broker + filesystem fresh, computes a diff, acts, returns. An exception inside is just lost work — the next cycle reconciles whatever is now true.
 
-```Python
-def append(batch_id, event):
-    line = json.dumps(event, separators=(",",":")) + "\n"
-    with batch_state_lock:                       # path stable for this whole block
-        path = locate_record(batch_id)
-        with log_lock:                           # exclusive writer
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(line)
-                f.flush()                        # Python buffer → OS
-                os.fsync(f.fileno())             # OS page cache → disk
+`cycle-worker` wraps the call in `try / except Exception`, increments `consecutive_failures`, and `stop_event.wait(backoff)` (capped at 60s). Resources are always released by `with` — stranding `batch_state_lock` would freeze the connector and the drain.
+
+A dropped event can't break correctness — `unfinished` from the broker is the live signal. A dropped `submit` line (crash between `order_volume` return and write) makes its `cl_ord_id` look foreign on the next cycle ⇒ error + skip; once it fills or the operator clears it, the diff catches up.
+
+## Connection guard
+
+When the trade channel drops, the SDK auto-reconnects, but during the gap `get_position()` may return empty (not raise) — and acting on empty would diff against zero and submit huge orders. `trade_channel_up: threading.Event` (set at startup, cleared on disconnect) gates the cycle:
+
+```python
+def run_cycle():
+    if not trade_channel_up.is_set():
+        log.warning("skipping cycle: trade channel down"); return
+    ...
 ```
-
-`batch_state_lock` is held for the whole block — `locate_record` does three `stat`s and we mustn't have a `move_pair` (or a connector mirror) slip in between the lookup and the open. `log_lock` is the writer-exclusion lock; it spans only the open + write + fsync + close so concurrent appends serialise but slow `fsync`s don't block moves.
-
-`move_pair(batch_id, dst)` symmetrically acquires `batch_state_lock` (and only that) for the rename. The connector's per-file mirror in `_import_pass` does the same. The cycle holds `batch_state_lock` for its entire `run_cycle` and re-enters here via `append`/`move_pair` thanks to its reentrant flavor.
-
-### Routing — `cl_ord_id → batch_id → file path`
-
-Callbacks have `cl_ord_id`. The map `clord_index: cl_ord_id → batch_id`:
-
-* **Startup** — `rebuild_clord_index()` scans every `*.order_record.jsonl` under `$GMX_ORDERS_DIR/{pending,finished,expired}/` for `submit` lines.
-* **Live** — each successful `order_volume(...)` registers its entry inside the same `log_lock` section as the `submit` write, so map and line update atomically.
-
-`locate_record(batch_id)` tries `pending/`, `finished/`, `expired/` and returns the first hit. Caller must hold `batch_state_lock`. Miss ⇒ warn + drop (only possible after manual tampering).
-
-### Reading the log (replay)
-
-Both the cycle's per-batch replay (to identify our own `cl_ord_id`s and check ages) and `rebuild_clord_index()` at startup parse the JSONL file:
-
-```Python
-def replay(path):
-    out = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            try:    out.append(json.loads(line))
-            except json.JSONDecodeError:
-                log.warning(f"corrupt line in {path}: {line!r}")
-                continue            # tolerate one partial last line after a crash
-    return out
-```
-
-Why this is safe — what could go wrong with concurrent / interrupted writes:
-
-| risk                                                          | actual exposure                                                                                                                                                                                 |
-| ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| reader sees a half-written line while a writer is mid-`write` | none in steady state: writers hold `log_lock` for the whole open→fsync→close. Cycle replay also acquires `log_lock` (briefly, just to copy the file or take a snapshot length) before iterating |
-| reader sees a half-written line **after a crash**             | possible only on the very last line; the `try/except` skips it. All preceding lines are durable thanks to `fsync`                                                                               |
-| two writers interleave bytes within one line                  | impossible: `log_lock` serialises full append calls                                                                                                                                             |
-| line not yet `\n`-terminated when reader stops                | impossible: `f.write(line)` writes the whole `"...\n"` in one call before `flush`/`fsync`                                                                                                       |
-| Unicode split across writes                                   | impossible: each line is a single `f.write` of a single str                                                                                                                                     |
-
-The replay never modifies the file, so concurrent replays are fine and never block writers (other than the brief `log_lock` they hold to take their snapshot).
-
-### Truth table — concurrency cases
-
-| event arrives                                 | state at append time                | outcome                                          |
-| --------------------------------------------- | ----------------------------------- | ------------------------------------------------ |
-| two writers race for the same file            | both hold valid `cl_ord_id`s        | `log_lock` serialises in lock-acquire order      |
-| `status` / `trade` for a known `cl_ord_id`    | batch in `pending/`                 | append in `pending/`                             |
-| `status` / `trade` for a known `cl_ord_id`    | batch moved to `finished`/`expired` | append wherever the file is now                  |
-| `status` / `trade` during process boot        | `clord_index` not yet rebuilt       | impossible — `init` rebuilds before timer starts |
-| `status` / `trade` for an unknown `cl_ord_id` | no submit line anywhere             | warn + drop                                      |
-
-### Truth table — what does the cycle *do* for one order?
-
-Two inputs: broker snapshot (`positions`, `unfinished`) + this batch's submit log (ownership only).
-
-| `unfinished[symbol]`          | log says about those `cl_ord_id`s | action                                                                    |
-| ----------------------------- | --------------------------------- | ------------------------------------------------------------------------- |
-| empty                         | —                                 | submit `target − held` if non-zero; else done                             |
-| has entries, **all** ours     | every `cl_ord_id` in submit lines | log info + skip symbol; per entry, log error if `now − created_at > 600s` |
-| has entries, **any** not ours | one or more missing from log      | log error + skip symbol — foreign order, operator must intervene          |
-
-A dropped callback can't break this — `unfinished` is the live signal. A dropped `submit` line (crash between `order_volume` return and the write) makes its `cl_ord_id` look foreign → error + skip; once it fills or the operator clears it, the next cycle's diff is correct.
 
 ## Lifecycle
 
-`gm.run()` hosts the strategy. Everything that happens to it surfaces either as the timer firing or as one of the callbacks below. We register the minimum and have a defined response for the rest. See [GM_SDK.md](./GM_SDK.md) for the per-callback object shapes.
+`init(context)` runs once after `run()` connects:
+1. `ensure_dirs()` + `rebuild_clord_index()`
+2. `callbacks.start()` — drain worker begins (after index rebuild, so queued events from before init see a populated index)
+3. `worker.start()` + `connector.start()`
+4. `timer(...)`
 
-**Connection guard.** When the trade channel drops, the SDK auto-reconnects, but during the gap `get_positions()` / `get_unfinished_orders()` may return **empty** (not raise) — and acting on that empty snapshot would diff against zero and submit huge orders. A `trade_channel_up: threading.Event` (set at startup, cleared on disconnect, re-set on reconnect) gates the cycle:
+Shutdown wraps `run()`:
 
-```Python
-trade_channel_up = threading.Event()
-trade_channel_up.set()                              # optimistic at startup; first heartbeat confirms
-
-def run_cycle() -> None:
-    if not trade_channel_up.is_set():
-        log.warning("skipping cycle: trade channel down"); return
-    ...                                             # rest of the cycle
-```
-
-### Event table
-
-| event                                       | when fires                                                                | action                                                                                          |
-| ------------------------------------------- | ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `init(context)`                             | once after `run()` connects                                               | `set_token`; rebuild `clord_index`; start connector + remote-log threads; register the timer    |
-| `on_order_status(context, order)`           | every `status` change                                                     | append one `status` event to the batch's `order_record.jsonl` (under `log_lock`)                |
-| `on_execution_report(context, execrpt)`     | every fill (`exec_type=15`) and every cancel-rejection (`exec_type=19`)   | append one `trade` event to the batch's `order_record.jsonl`                                    |
-| `on_trade_data_connected(context)`          | trade channel up (initial or after reconnect)                             | `trade_channel_up.set()`; log info                                                              |
-| `on_trade_data_disconnected(context)`       | trade channel drops (SDK auto-reconnects)                                 | `trade_channel_up.clear()`; log warning. Cycle skips itself until restored                      |
-| `on_account_status(context, account)`       | account state changes (connected / logged-in / disconnected / error)     | log. On `disconnected` / `error`, clear `trade_channel_up`; on `logged-in`, set it             |
-| `on_market_data_connected(context)`         | market-data channel up                                                    | log info — we don't subscribe to ticks or bars                                                  |
-| `on_market_data_disconnected(context)`      | market-data channel down                                                  | log info                                                                                        |
-| `on_error(context, code, info)`             | SDK-level error (network glitch, RPC error, ...)                          | log `code` + `info`; never raise out. SDK keeps running                                         |
-| `on_tick`, `on_bar`                         | —                                                                         | not registered                                                                                  |
-| `on_backtest_finished`                      | backtest only                                                             | n/a — we always run `MODE_LIVE`                                                                 |
-| `SIGINT` / `SIGTERM` (operator)             | external signal to main thread                                            | main sets `stop_event` → workers exit → call SDK `stop()` → return                              |
-
-**Two rules every callback obeys**:
-
-1. **Append-only side effect.** A callback only ever appends to an `order_record.jsonl` (or toggles `trade_channel_up`). It never calls `run_cycle`, never submits, never cancels.
-2. **Never raise.** An uncaught exception in a callback can take down the SDK's dispatch loop. Wrap every callback body in `try / except Exception: log.exception(...)`.
-
-### Shutdown
-
-`gm.run()` blocks the main thread; the workers (connector, remote-log relay, SDK internals) do not receive signals. Wrap `run()`:
-
-```Python
-def main() -> None:
-    try:
-        run(strategy_id=..., filename=..., mode=MODE_LIVE, token=GM_TOKEN)
-    except KeyboardInterrupt:
-        log.info("SIGINT received; shutting down")
+```python
+def main():
+    try: run(...)
+    except KeyboardInterrupt: log.info("SIGINT received; shutting down")
     finally:
-        stop_event.set()                            # wakes connector + remote-log relay
-        for t in worker_threads:
-            t.join(timeout=10)                      # daemon, abrupt-killed if join overruns
-        try: stop()                                 # ask the SDK to close cleanly
+        stop_event.set()                                 # wakes cycle, connector
+        callbacks.stop()                                 # sentinel wakes drain
+        for t in worker_threads: t.join(timeout=10)
+        try: stop()
         except Exception: log.exception("gm.stop() failed")
 ```
 
-In-flight orders are **never** cancelled at shutdown — that's neither the cycle's nor `stop()`'s job. The broker keeps them on the book; on the next startup, the cycle's pass-1 expiry handler cancels anything whose batch has gone past `expires_at`. A clean shutdown and a crash look identical to the broker.
-
-`order_record.jsonl` is durable per append (`fsync` before close), so a crash anywhere never loses a recorded event.
-
-## Failure handling
-
-Never halt on data or trading errors. Per-order exceptions stay local; cycle-wide exceptions early-return and retry next fire. A batch leaves `pending/` only as **finished**, **expired**, or **invalid**.
+In-flight orders are **never** cancelled at shutdown. The broker keeps them; on next startup, pass-1 expiry cancels anything past `expires_at`. A clean shutdown and a crash look identical to the broker.
 
 ## Config (env)
 
-* `GM_TOKEN`         — auth, passed to `set_token`.
-* `GM_ACCOUNT_ID`    — default account when a batch omits `account_id`.
-* `GMX_ORDERS_DIR`   — orders root containing `pending/`, `finished/`, `expired/`, `failed/`. Default `./orders`. Resolved once at startup; every path lookup, glob, move, and rebuild scan in this document is relative to it.
-* `GMX_POLL_SECONDS` — timer interval, default 30.
-
+| var                | required | default    | meaning                                              |
+| ------------------ | -------- | ---------- | ---------------------------------------------------- |
+| `GM_TOKEN`         | **yes**  | —          | auth, passed to `set_token`                          |
+| `GM_ACCOUNT_ID`    | no       | —          | default when a batch omits `account_id`              |
+| `GMX_ORDERS_DIR`   | no       | `./orders` | orders root for `pending/`, `finished/`, `expired/`, `failed/` |
+| `GMX_POLL_SECONDS` | no       | `30`       | timer interval                                       |

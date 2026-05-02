@@ -88,6 +88,7 @@ def _peek_batch(path: Path) -> tuple[str, int, int]:
 # ── loop ──────────────────────────────────────────────────────────────
 
 def _one_pass() -> None:
+    log.info("connector tick")
     try:
         _sync_repo()
     except subprocess.CalledProcessError as e:
@@ -102,8 +103,12 @@ def _one_pass() -> None:
 
 
 def connector_loop() -> None:
-    while not state.stop_event.wait(config.GIT_PULL_SECONDS):
-        _one_pass()
+    log.info("connector loop started: pull_seconds=%d", config.GIT_PULL_SECONDS)
+    try:
+        while not state.stop_event.wait(config.GIT_PULL_SECONDS):
+            _one_pass()
+    except Exception:
+        log.exception("connector loop crashed; thread exiting")
 
 
 def _import_pass() -> None:

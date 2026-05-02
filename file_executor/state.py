@@ -31,6 +31,10 @@ Held by:
   no connector edit, no callback-driven move can interleave);
 - the connector around `is_terminal(batch_id)` + `atomic_copy` (so its mirror cannot
   resurrect a freshly-finalized batch);
+- the `callback-processor` daemon for each event drained from the SDK queue (so it
+  observes `clord_index` only after the in-flight cycle commits — no race-drop of
+  events for orders we just submitted). The SDK callback functions themselves only
+  snapshot + enqueue; they never touch this lock;
 - `order_log.move_pair` / `move_invalid` (cross-directory moves);
 - `order_log.append` / `replay_record` / `locate_record` (path lookups must agree
   with whichever directory currently owns the batch).

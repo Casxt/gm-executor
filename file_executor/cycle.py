@@ -213,6 +213,7 @@ def _submit(batch_id: str, order_id: str, symbol: str, diff: int,
         if not cl_ord_id:
             log.error("order_volume returned a result without cl_ord_id: %r", r)
             continue
+        order_log.clord_index[cl_ord_id] = batch_id
         log.info("  registering cl_ord_id=%s for batch=%s order=%s",
                  cl_ord_id, batch_id, order_id)
         order_log.append(batch_id, {
@@ -226,7 +227,7 @@ def _submit(batch_id: str, order_id: str, symbol: str, diff: int,
             "order_type":      order_type_str,
             "price":           submit_price if order_type_str == "limit" else 0,
             "cl_ord_id":       cl_ord_id,
-        }, register_cl_ord_id=cl_ord_id)
+        })
 
 
 # ── matched ───────────────────────────────────────────────────────────

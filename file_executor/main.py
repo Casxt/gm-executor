@@ -54,6 +54,11 @@ def init(context) -> None:
     config.ensure_dirs()
     order_log.rebuild_clord_index()
 
+    # Drain callbacks AFTER clord_index is rebuilt: any queued events from before
+    # init() (e.g. broker replaying in-flight statuses on reconnect) will then see
+    # a populated index instead of being warned as foreign.
+    _cb.start()
+
     # if config.GM_TOKEN:
     #     set_token(config.GM_TOKEN)
 
@@ -98,6 +103,7 @@ def main() -> None:
 def _shutdown() -> None:
     state.stop_event.set()
     state.cycle_pending.set()                                # wake cycle_worker
+    _cb.stop()                                                # wake callback-processor
     for t in state.worker_threads:
         t.join(timeout=10)
     try:

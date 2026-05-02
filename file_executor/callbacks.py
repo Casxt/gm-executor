@@ -4,9 +4,18 @@ Two rules from FLOW.md:
 1. Append-only side effect: a callback either appends one log line or toggles a flag.
 2. Never raise: an uncaught exception inside a callback can take down the SDK's
    dispatch loop. Every body is wrapped in `try / except Exception: log.exception(...)`.
+
+`on_order_status` and `on_execution_report` use a producer/consumer split: the SDK
+dispatch thread snapshots the event into a `queue.SimpleQueue` and returns immediately.
+A daemon thread (`callback-processor`) drains the queue and does the real work — index
+lookup + log append — under `batch_state_lock`. This keeps the SDK dispatch thread off
+our locks entirely, and lets events delivered during a cycle wait safely in the queue
+until the cycle releases.
 """
 
 import logging
+import queue
+import threading
 
 from gm.api import (
     ExecType_CancelRejected,
@@ -58,74 +67,163 @@ def on_timer(context) -> None:
 
 # ── trading events ────────────────────────────────────────────────────
 
+_event_queue: "queue.SimpleQueue[dict | None]" = queue.SimpleQueue()
+"""SDK → drain pipe. SDK dispatch thread puts; `_drain_loop` thread takes. Sentinel `None` ⇒ stop."""
+
+
 def on_order_status(context, order) -> None:
     try:
-        cl_ord_id   = order.cl_ord_id
-        status      = int(order.status)
-        status_text = _STATUS_TEXTS.get(status, f"Status{status}")
-        symbol      = getattr(order, "symbol", "") or ""
-        batch_id    = order_log.clord_index.get(cl_ord_id)
-        if batch_id is None:
-            log.warning("status for unknown cl_ord_id=%s symbol=%s status=%d (%s); dropping",
-                        cl_ord_id, symbol, status, status_text)
-            return
-        ev: dict = {
-            "ts_ms":         unix_now_ms(),
-            "event":         "status",
-            "cl_ord_id":     cl_ord_id,
-            "symbol":        symbol,
-            "status":        status,
-            "status_text":   status_text,
-            "filled_volume": int(order.filled_volume or 0),
-        }
-        if status == OrderStatus_Rejected:
-            reason = int(getattr(order, "ord_rej_reason", 0) or 0)
-            ev["ord_rej_reason"]        = reason
-            ev["ord_rej_reason_text"]   = _REJ_REASON_TEXTS.get(reason, f"Reason{reason}")
-            ev["ord_rej_reason_detail"] = getattr(order, "ord_rej_reason_detail", "") or ""
-        order_log.append(batch_id, ev)
+        # Snapshot every field we'll need: the SDK may reuse / free `order` once we return.
+        cl_ord_id = order.cl_ord_id
+        symbol    = getattr(order, "symbol", "") or ""
+        status    = int(order.status)
+        log.info("recv status: cl_ord_id=%s symbol=%s status=%d (%s)",
+                 cl_ord_id, symbol, status, _STATUS_TEXTS.get(status, f"Status{status}"))
+        _event_queue.put({
+            "kind":                  "status",
+            "ts_ms":                 unix_now_ms(),
+            "cl_ord_id":             cl_ord_id,
+            "symbol":                symbol,
+            "status":                status,
+            "filled_volume":         int(order.filled_volume or 0),
+            "ord_rej_reason":        int(getattr(order, "ord_rej_reason", 0) or 0),
+            "ord_rej_reason_detail": getattr(order, "ord_rej_reason_detail", "") or "",
+        })
     except Exception:
-        log.exception("on_order_status failed")
+        log.exception("on_order_status enqueue failed")
 
 
 def on_execution_report(context, execrpt) -> None:
     try:
         cl_ord_id = execrpt.cl_ord_id
-        exec_type = int(execrpt.exec_type)
         symbol    = getattr(execrpt, "symbol", "") or ""
-        batch_id  = order_log.clord_index.get(cl_ord_id)
-        if batch_id is None:
-            log.warning("execrpt for unknown cl_ord_id=%s symbol=%s exec_type=%d (%s); dropping",
-                        cl_ord_id, symbol, exec_type, _exec_type_text(exec_type))
-            return
-        ev: dict = {
+        exec_type = int(execrpt.exec_type)
+        log.info("recv execrpt: cl_ord_id=%s symbol=%s exec_type=%d (%s)",
+                 cl_ord_id, symbol, exec_type, _exec_type_text(exec_type))
+        snap: dict = {
+            "kind":            "execrpt",
             "ts_ms":           unix_now_ms(),
-            "event":           "trade",
             "cl_ord_id":       cl_ord_id,
+            "symbol":          symbol,
+            "exec_type":       exec_type,
             "broker_order_id": getattr(execrpt, "order_id", "") or "",
             "exec_id":         getattr(execrpt, "exec_id", "") or "",
+            "broker_ts_ms":    _broker_ts_ms(execrpt),
+        }
+        if exec_type == ExecType_Trade:
+            snap["side"]   = int(execrpt.side)
+            snap["volume"] = int(execrpt.volume)
+            snap["price"]  = float(execrpt.price)
+            snap["amount"] = float(execrpt.amount)
+        elif exec_type == ExecType_CancelRejected:
+            snap["ord_rej_reason"]        = int(getattr(execrpt, "ord_rej_reason", 0) or 0)
+            snap["ord_rej_reason_detail"] = getattr(execrpt, "ord_rej_reason_detail", "") or ""
+        _event_queue.put(snap)
+    except Exception:
+        log.exception("on_execution_report enqueue failed")
+
+
+# ── drain worker ──────────────────────────────────────────────────────
+
+def _drain_loop() -> None:
+    while True:
+        try:
+            evt = _event_queue.get()                            # blocks
+        except Exception:
+            log.exception("event queue read failed")
+            continue
+        if evt is None:                                          # sentinel from stop()
+            return
+        try:
+            if evt["kind"] == "status":
+                _process_status(evt)
+            else:
+                _process_execrpt(evt)
+        except Exception:
+            log.exception("event processor failed: %r", evt)
+
+
+def _process_status(evt: dict) -> None:
+    cl_ord_id   = evt["cl_ord_id"]
+    status      = evt["status"]
+    status_text = _STATUS_TEXTS.get(status, f"Status{status}")
+    symbol      = evt["symbol"]
+
+    rej_fields: dict = {}
+    if status == OrderStatus_Rejected:
+        reason = evt["ord_rej_reason"]
+        rej_fields["ord_rej_reason"]        = reason
+        rej_fields["ord_rej_reason_text"]   = _REJ_REASON_TEXTS.get(reason, f"Reason{reason}")
+        rej_fields["ord_rej_reason_detail"] = evt["ord_rej_reason_detail"]
+
+    with state.batch_state_lock:
+        batch_id = order_log.clord_index.get(cl_ord_id)
+        if batch_id is None:
+            extra = (f" reason={rej_fields['ord_rej_reason']} ({rej_fields['ord_rej_reason_text']}) "
+                     f"detail={rej_fields['ord_rej_reason_detail']!r}") if rej_fields else ""
+            log.warning("status for foreign cl_ord_id=%s symbol=%s status=%d (%s)%s; dropping",
+                        cl_ord_id, symbol, status, status_text, extra)
+            return
+        order_log.append(batch_id, {
+            "ts_ms":         evt["ts_ms"],
+            "event":         "status",
+            "cl_ord_id":     cl_ord_id,
+            "symbol":        symbol,
+            "status":        status,
+            "status_text":   status_text,
+            "filled_volume": evt["filled_volume"],
+            **rej_fields,
+        })
+
+
+def _process_execrpt(evt: dict) -> None:
+    cl_ord_id = evt["cl_ord_id"]
+    exec_type = evt["exec_type"]
+    symbol    = evt["symbol"]
+
+    with state.batch_state_lock:
+        batch_id = order_log.clord_index.get(cl_ord_id)
+        if batch_id is None:
+            log.warning("execrpt for foreign cl_ord_id=%s symbol=%s exec_type=%d (%s); dropping",
+                        cl_ord_id, symbol, exec_type, _exec_type_text(exec_type))
+            return
+
+        ev: dict = {
+            "ts_ms":           evt["ts_ms"],
+            "event":           "trade",
+            "cl_ord_id":       cl_ord_id,
+            "broker_order_id": evt["broker_order_id"],
+            "exec_id":         evt["exec_id"],
             "exec_type":       exec_type,
             "exec_type_text":  _exec_type_text(exec_type),
             "symbol":          symbol,
-            "broker_ts_ms":    _broker_ts_ms(execrpt),
+            "broker_ts_ms":    evt["broker_ts_ms"],
         }
-
-        if exec_type == ExecType_Trade:                      # fill chunk
-            side = int(execrpt.side)
+        if exec_type == ExecType_Trade:
+            side = evt["side"]
             ev["side"]      = side
             ev["side_text"] = "buy" if side == OrderSide_Buy else "sell"
-            ev["volume"]    = int(execrpt.volume)
-            ev["price"]     = float(execrpt.price)
-            ev["amount"]    = float(execrpt.amount)
+            ev["volume"]    = evt["volume"]
+            ev["price"]     = evt["price"]
+            ev["amount"]    = evt["amount"]
         elif exec_type == ExecType_CancelRejected:
-            reason = int(getattr(execrpt, "ord_rej_reason", 0) or 0)
+            reason = evt["ord_rej_reason"]
             ev["ord_rej_reason"]        = reason
             ev["ord_rej_reason_text"]   = _REJ_REASON_TEXTS.get(reason, f"Reason{reason}")
-            ev["ord_rej_reason_detail"] = getattr(execrpt, "ord_rej_reason_detail", "") or ""
-
+            ev["ord_rej_reason_detail"] = evt["ord_rej_reason_detail"]
         order_log.append(batch_id, ev)
-    except Exception:
-        log.exception("on_execution_report failed")
+
+
+def start() -> threading.Thread:
+    t = threading.Thread(target=_drain_loop, name="callback-processor", daemon=True)
+    t.start()
+    state.worker_threads.append(t)
+    return t
+
+
+def stop() -> None:
+    """Wake the drain loop with a sentinel so it can exit cleanly."""
+    _event_queue.put(None)
 
 
 # ── connection events ─────────────────────────────────────────────────
