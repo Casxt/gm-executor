@@ -43,18 +43,22 @@ def on_timer(context) -> None:
 
 def on_order_status(context, order) -> None:
     try:
-        cl_ord_id = order.cl_ord_id
-        batch_id  = order_log.clord_index.get(cl_ord_id)
+        cl_ord_id   = order.cl_ord_id
+        status      = int(order.status)
+        status_text = _STATUS_TEXTS.get(status, f"Status{status}")
+        symbol      = getattr(order, "symbol", "") or ""
+        batch_id    = order_log.clord_index.get(cl_ord_id)
         if batch_id is None:
-            log.warning("status for unknown cl_ord_id=%s; dropping", cl_ord_id)
+            log.warning("status for unknown cl_ord_id=%s symbol=%s status=%d (%s); dropping",
+                        cl_ord_id, symbol, status, status_text)
             return
-        status = int(order.status)
         order_log.append(batch_id, {
             "ts_ms":          unix_now_ms(),
             "event":          "status",
             "cl_ord_id":      cl_ord_id,
+            "symbol":         symbol,
             "status":         status,
-            "status_text":    _STATUS_TEXTS.get(status, f"Status{status}"),
+            "status_text":    status_text,
             "filled_volume":  int(order.filled_volume or 0),
             "ord_rej_reason": int(getattr(order, "ord_rej_reason", 0) or 0),
         })
@@ -65,12 +69,13 @@ def on_order_status(context, order) -> None:
 def on_execution_report(context, execrpt) -> None:
     try:
         cl_ord_id = execrpt.cl_ord_id
+        exec_type = int(execrpt.exec_type)
+        symbol    = getattr(execrpt, "symbol", "") or ""
         batch_id  = order_log.clord_index.get(cl_ord_id)
         if batch_id is None:
-            log.warning("execrpt for unknown cl_ord_id=%s; dropping", cl_ord_id)
+            log.warning("execrpt for unknown cl_ord_id=%s symbol=%s exec_type=%d (%s); dropping",
+                        cl_ord_id, symbol, exec_type, _exec_type_text(exec_type))
             return
-
-        exec_type = int(execrpt.exec_type)
         ev: dict = {
             "ts_ms":           unix_now_ms(),
             "event":           "trade",
@@ -79,7 +84,7 @@ def on_execution_report(context, execrpt) -> None:
             "exec_id":         getattr(execrpt, "exec_id", "") or "",
             "exec_type":       exec_type,
             "exec_type_text":  _exec_type_text(exec_type),
-            "symbol":          execrpt.symbol,
+            "symbol":          symbol,
             "broker_ts_ms":    _broker_ts_ms(execrpt),
         }
 

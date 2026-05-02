@@ -75,12 +75,12 @@ def append(batch_id: str, event: dict[str, Any], *, register_cl_ord_id: str | No
             path.parent.mkdir(parents=True, exist_ok=True)
 
         with state.log_lock:
+            if register_cl_ord_id is not None:
+                clord_index[register_cl_ord_id] = batch_id   # register BEFORE fsync — callbacks racing on this id otherwise miss for ~8ms (fsync wall time)
             with open(path, "a", encoding="utf-8") as f:
                 f.write(line)
                 f.flush()
                 os.fsync(f.fileno())
-            if register_cl_ord_id is not None:
-                clord_index[register_cl_ord_id] = batch_id
 
 
 # ── replay ────────────────────────────────────────────────────────────
