@@ -146,18 +146,18 @@ def _import_pass() -> None:
             log.warning("connector: refusing %s — valid_at(%d) >= expires_at(%d)",
                         batch_id, valid_at, expires_at)
             continue
-        if now >= expires_at:
-            continue                                          # already expired
 
         dst = config.PENDING_DIR / f"{batch_id}.json"
         try:
             with state.batch_state_lock:
                 if _is_terminal(batch_id):
                     continue                                  # finalized; never resurrect
-                src_bytes = path.read_bytes()
-                if dst.exists() and dst.read_bytes() == src_bytes:
-                    continue                                  # already mirrored
                 existed = dst.exists()
+                if not existed and now >= expires_at:
+                    continue                                  # first import + already expired ⇒ skip
+                src_bytes = path.read_bytes()
+                if existed and dst.read_bytes() == src_bytes:
+                    continue                                  # already mirrored
                 _atomic_copy(path, dst)
             log.info("connector: %s %s", "updated" if existed else "imported", batch_id)
         except Exception:
