@@ -135,6 +135,9 @@ def _drain_loop() -> None:
         if evt is None:                                          # sentinel from stop()
             return
         try:
+            pending_ms = unix_now_ms() - evt["ts_ms"]
+            log.info("process %s: cl_ord_id=%s symbol=%s pending=%dms",
+                     evt["kind"], evt["cl_ord_id"], evt.get("symbol", ""), pending_ms)
             if evt["kind"] == "status":
                 _process_status(evt)
             else:
