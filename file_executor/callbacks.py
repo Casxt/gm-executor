@@ -108,13 +108,25 @@ def on_market_data_disconnected(context) -> None:
 
 def on_account_status(context, account) -> None:
     try:
-        status = int(getattr(account, "status", 0) or 0)
-        log.info("account status: id=%s status=%d",
-                 getattr(account, "account_id", "?"), status)
+        # account.status is a DictLikeConnectionStatus (dict subclass) — the int
+        # connection-state code lives on its `.state` attribute. See GM_SDK.md.
+        conn = getattr(account, "status", None)
+        state_code = int(getattr(conn, "state", 0) or 0)
+        err = getattr(conn, "error", None) if conn else None
+        err_code = int(getattr(err, "code", 0) or 0) if err else 0
+
+        if err_code:
+            log.warning("account status: id=%s state=%d err_code=%d info=%s",
+                        getattr(account, "account_id", "?"), state_code, err_code,
+                        getattr(err, "info", "") or "")
+        else:
+            log.info("account status: id=%s state=%d",
+                     getattr(account, "account_id", "?"), state_code)
+
         # Per myquant docs: 1=connected, 2=logged-in, 3=disconnected, 4=error.
-        if status in (3, 4):
+        if state_code in (3, 4):
             state.trade_channel_up.clear()
-        elif status == 2:
+        elif state_code == 2:
             state.trade_channel_up.set()
     except Exception:
         log.exception("on_account_status failed")

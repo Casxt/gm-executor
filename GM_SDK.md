@@ -155,6 +155,8 @@ We never see other `ExecType` values in practice for our workflow.
 | `on_execution_report(context, execrpt)` | each fill chunk and each cancel-rejection                           | append a `trade` event to the batch's `order_record`  |
 | `on_trade_data_disconnected(context)`   | broker channel drops                                                | log only; SDK auto-reconnects                             |
 | `on_trade_data_connected(context)`      | broker channel restored                                             | log only                                                  |
+| `on_account_status(context, account)`   | account-level connection state changes (login, disconnect, error)   | log + toggle `state.trade_channel_up`                   |
+| `on_error(context, code, info)`         | SDK-level error (e.g. trade msg service down)                       | log only                                                  |
 | `on_bar` / `on_tick`                  | —                                                                  | not registered                                            |
 
 ### `Order` (passed to `on_order_status`)
@@ -198,6 +200,21 @@ We never read `target_volume`/`target_value`/`target_percent`/`order_business`/`
 | `created_at`                                                | broker-side event timestamp (`datetime.datetime`)            |
 
 Commission is **not** on `ExecRpt` — only the cumulative `filled_commission` on `Order` carries that. If you need per-fill commission, diff successive `status` lines.
+
+### `AccountStatus` (passed to `on_account_status`)
+
+`account.status` is **not** an int — it's a `DictLikeConnectionStatus` (a `dict` subclass with attribute access). Reading `int(account.status)` raises `TypeError`. Drill in via `.state`:
+
+| field                  | meaning                                                                          |
+| ---------------------- | -------------------------------------------------------------------------------- |
+| `account.account_id` | account id                                                                       |
+| `account.status.state` | int connection-state code: `1`=connected, `2`=logged-in, `3`=disconnected, `4`=error |
+| `account.status.error` | `DictLikeError` (also a `dict` subclass) — populated only when `state == 4` |
+| `account.status.error.code` | int error code                                                               |
+| `account.status.error.type` | error type string                                                            |
+| `account.status.error.info` | human-readable description                                                   |
+
+`state == 2` is the "ready to trade" signal we toggle `trade_channel_up` on; `3` and `4` clear it.
 
 **Rule:** no callback ever calls `run_cycle` or any business logic. Their **only** side effect is one append to the appropriate `order_record`. See [FLOW.md → Log writing](./FLOW.md#log-writing) for the safety contract.
 

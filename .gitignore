@@ -53,3 +53,8 @@ desktop.ini
 
 # ── Claude Code (keep shared settings, ignore local-only) ─────────────
 .claude/settings.local.json
+
+
+# script
+
+run_file_executor.ps1

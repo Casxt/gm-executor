@@ -74,14 +74,23 @@ def main() -> None:
         log.error("GM_TOKEN env var not set; aborting")
         sys.exit(1)
 
+    # gm.api.run() derives a module name by str-prefix-matching `filename` against
+    # sys.path entries (which it forces to forward slashes), then converts separators
+    # to dots. On Windows the filename keeps backslashes, so commonprefix collapses to
+    # "C:" and the result becomes a relative import like ".Users.kaizh...main". Pass
+    # forward slashes so the SDK's prefix match finds the real sys.path entry.
+    strategy_file = os.path.abspath(__file__).replace(os.sep, "/")
+
     try:
         run(strategy_id=config.GM_STRATEGY_ID,
-            filename=os.path.abspath(__file__),
+            filename=strategy_file,
             mode=MODE_LIVE,
             token=config.GM_TOKEN,
             serv_addr=config.GM_SERV_ADDR or "")
     except KeyboardInterrupt:
         log.info("SIGINT received; shutting down")
+    except Exception:
+        log.exception("gm.run() crashed; shutting down")
     finally:
         _shutdown()
 
