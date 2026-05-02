@@ -112,28 +112,32 @@ Pass a single `Order` or a list. Available for ad-hoc operator use; gm-executor'
 
 ### `OrderStatus` (lifecycle of one `cl_ord_id`)
 
-| code | constant            | zh     | meaning                                            | class    |
-| ---- | ------------------- | ------ | -------------------------------------------------- | -------- |
-| 10   | `PendingNew`      | 待报   | accepted by SDK, not yet sent to broker            | live     |
-| 1    | `New`             | 已报   | broker accepted; resting on the book               | live     |
-| 2    | `PartiallyFilled` | 部成   | partial fill; remainder still on the book          | live     |
-| 15   | `PendingTrigger`  | 待触发 | conditional order armed (CTP futures only)         | live     |
-| 16   | `Triggered`       | 已触发 | conditional order fired (CTP futures only)         | live     |
-| 3    | `Filled`          | 已成   | fully filled                                       | terminal |
-| 5    | `Canceled`        | 已撤   | cancelled (broker confirmed)                       | terminal |
-| 8    | `Rejected`        | 已拒绝 | broker refused; see `ord_rej_reason`             | terminal |
-| 12   | `Expired`         | 已过期 | broker timed it out (e.g. session close, GTD past) | terminal |
+Imported as `OrderStatus_*` from `gm.api` (canonical defs in `gm/enum.py`). Always use the named constant — never the raw int.
 
-A `cl_ord_id` only ever moves **live → terminal** and never back. Once terminal, no further status events fire for it. A-shares only see `PendingNew → New → (PartiallyFilled* →) Filled` on the happy path; conditional statuses (`15`, `16`) never appear for stocks.
+| constant                       | value | zh     | meaning                                            | class    |
+| ------------------------------ | ----- | ------ | -------------------------------------------------- | -------- |
+| `OrderStatus_PendingNew`     | `10`| 待报   | accepted by SDK, not yet sent to broker            | live     |
+| `OrderStatus_New`            | `1` | 已报   | broker accepted; resting on the book               | live     |
+| `OrderStatus_PartiallyFilled`| `2` | 部成   | partial fill; remainder still on the book          | live     |
+| `OrderStatus_Filled`         | `3` | 已成   | fully filled                                       | terminal |
+| `OrderStatus_Canceled`       | `5` | 已撤   | cancelled (broker confirmed)                       | terminal |
+| `OrderStatus_Rejected`       | `8` | 已拒绝 | broker refused; see `ord_rej_reason`             | terminal |
+| `OrderStatus_Expired`        | `12`| 已过期 | broker timed it out (e.g. session close, GTD past) | terminal |
+
+`OrderStatus_DoneForDay` (`4`), `_PendingCancel` (`6`), `_Stopped` (`7`), `_Suspended` (`9`), `_Calculated` (`11`), `_AcceptedForBidding` (`13`), `_PendingReplace` (`14`) also exist in the SDK but never fire for our A-shares flow. The enum stops at `14` — there is no `PendingTrigger`/`Triggered` constant in this SDK build.
+
+A `cl_ord_id` only ever moves **live → terminal** and never back. Once terminal, no further status events fire for it. A-shares only see `PendingNew → New → (PartiallyFilled* →) Filled` on the happy path.
 
 `OrderRejectReason` gives the cause when `status == Rejected`: insufficient funds (`2`), insufficient position (`3`), illegal price/volume (`6`,`7`), non-trading session (`13`), throttled (`15`), and others. We log it but never treat any specific code specially — rejection is just terminal.
 
 ### `ExecType` (execution-report kind)
 
-| code | constant           | zh       | meaning                                                                       |
-| ---- | ------------------ | -------- | ----------------------------------------------------------------------------- |
-| 15   | `Trade`          | 成交     | a fill chunk (one trade against the order book)                               |
-| 19   | `CancelRejected` | 撤单被拒 | a `order_cancel(...)` was refused (e.g. already filled / already cancelled) |
+Imported as `ExecType_*` from `gm.api`. Always use the named constant.
+
+| constant                  | value | zh       | meaning                                                                       |
+| ------------------------- | ----- | -------- | ----------------------------------------------------------------------------- |
+| `ExecType_Trade`        | `15`| 成交     | a fill chunk (one trade against the order book)                               |
+| `ExecType_CancelRejected` | `19`| 撤单被拒 | a `order_cancel(...)` was refused (e.g. already filled / already cancelled) |
 
 We never see other `ExecType` values in practice for our workflow.
 
@@ -208,13 +212,24 @@ Commission is **not** on `ExecRpt` — only the cumulative `filled_commission` o
 | field                  | meaning                                                                          |
 | ---------------------- | -------------------------------------------------------------------------------- |
 | `account.account_id` | account id                                                                       |
-| `account.status.state` | int connection-state code: `1`=connected, `2`=logged-in, `3`=disconnected, `4`=error |
-| `account.status.error` | `DictLikeError` (also a `dict` subclass) — populated only when `state == 4` |
+| `account.status.state` | int connection-state code (see `ConnectionStatus.State` enum below)          |
+| `account.status.error` | `DictLikeError` (also a `dict` subclass) — populated only when `state == 6` |
 | `account.status.error.code` | int error code                                                               |
 | `account.status.error.type` | error type string                                                            |
 | `account.status.error.info` | human-readable description                                                   |
 
-`state == 2` is the "ready to trade" signal we toggle `trade_channel_up` on; `3` and `4` clear it.
+Connection-state constants are exported from `gm.api` (canonical defs in `gm/enum.py`). Always import the named constants — never hard-code the integer:
+
+| constant                | value | meaning                                          |
+| ----------------------- | ----- | ------------------------------------------------ |
+| `State_CONNECTING`    | `1` | TCP handshake in progress                        |
+| `State_CONNECTED`     | `2` | socket up, login not yet acknowledged            |
+| `State_LOGGEDIN`      | `3` | **ready to trade** — toggles `trade_channel_up` on |
+| `State_DISCONNECTING` | `4` | graceful teardown                                |
+| `State_DISCONNECTED`  | `5` | socket down                                      |
+| `State_ERROR`         | `6` | error state — `error.{code,type,info}` populated |
+
+We `set()` `trade_channel_up` on `State_LOGGEDIN`; `State_DISCONNECTING / State_DISCONNECTED / State_ERROR` clear it. `State_CONNECTING` and `State_CONNECTED` are intermediate — neither sets nor clears.
 
 **Rule:** no callback ever calls `run_cycle` or any business logic. Their **only** side effect is one append to the appropriate `order_record`. See [FLOW.md → Log writing](./FLOW.md#log-writing) for the safety contract.
 

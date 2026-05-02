@@ -8,6 +8,25 @@ Two rules from FLOW.md:
 
 import logging
 
+from gm.api import (
+    ExecType_CancelRejected,
+    ExecType_Trade,
+    OrderSide_Buy,
+    OrderStatus_Canceled,
+    OrderStatus_Expired,
+    OrderStatus_Filled,
+    OrderStatus_New,
+    OrderStatus_PartiallyFilled,
+    OrderStatus_PendingNew,
+    OrderStatus_Rejected,
+    State_CONNECTED,
+    State_CONNECTING,
+    State_DISCONNECTED,
+    State_DISCONNECTING,
+    State_ERROR,
+    State_LOGGEDIN,
+)
+
 from . import order_log, state
 from .cycle import unix_now_ms
 
@@ -64,14 +83,14 @@ def on_execution_report(context, execrpt) -> None:
             "broker_ts_ms":    _broker_ts_ms(execrpt),
         }
 
-        if exec_type == 15:                                  # fill chunk
+        if exec_type == ExecType_Trade:                      # fill chunk
             side = int(execrpt.side)
             ev["side"]      = side
-            ev["side_text"] = "buy" if side == 1 else "sell"
+            ev["side_text"] = "buy" if side == OrderSide_Buy else "sell"
             ev["volume"]    = int(execrpt.volume)
             ev["price"]     = float(execrpt.price)
             ev["amount"]    = float(execrpt.amount)
-        elif exec_type == 19:                                # cancel-rejected
+        elif exec_type == ExecType_CancelRejected:
             ev["ord_rej_reason"]        = int(getattr(execrpt, "ord_rej_reason", 0) or 0)
             ev["ord_rej_reason_detail"] = getattr(execrpt, "ord_rej_reason_detail", "") or ""
 
@@ -115,18 +134,20 @@ def on_account_status(context, account) -> None:
         err = getattr(conn, "error", None) if conn else None
         err_code = int(getattr(err, "code", 0) or 0) if err else 0
 
+        state_text = _CONN_STATE_TEXTS.get(state_code, f"State{state_code}")
         if err_code:
-            log.warning("account status: id=%s state=%d err_code=%d info=%s",
-                        getattr(account, "account_id", "?"), state_code, err_code,
-                        getattr(err, "info", "") or "")
+            log.warning("account status: id=%s state=%d (%s) err_code=%d info=%s",
+                        getattr(account, "account_id", "?"), state_code, state_text,
+                        err_code, getattr(err, "info", "") or "")
         else:
-            log.info("account status: id=%s state=%d",
-                     getattr(account, "account_id", "?"), state_code)
+            log.info("account status: id=%s state=%d (%s)",
+                     getattr(account, "account_id", "?"), state_code, state_text)
 
-        # Per myquant docs: 1=connected, 2=logged-in, 3=disconnected, 4=error.
-        if state_code in (3, 4):
+        # State_LOGGEDIN is the "ready to trade" signal; anything past it is
+        # teardown or failure. Constants from gm.api (see gm/enum.py).
+        if state_code in (State_DISCONNECTING, State_DISCONNECTED, State_ERROR):
             state.trade_channel_up.clear()
-        elif state_code == 2:
+        elif state_code == State_LOGGEDIN:
             state.trade_channel_up.set()
     except Exception:
         log.exception("on_account_status failed")
@@ -141,23 +162,31 @@ def on_error(context, code, info) -> None:
 
 # ── lookups ───────────────────────────────────────────────────────────
 
+_CONN_STATE_TEXTS: dict[int, str] = {
+    State_CONNECTING:    "Connecting",
+    State_CONNECTED:     "Connected",
+    State_LOGGEDIN:      "LoggedIn",
+    State_DISCONNECTING: "Disconnecting",
+    State_DISCONNECTED:  "Disconnected",
+    State_ERROR:         "Error",
+}
+
+
 _STATUS_TEXTS: dict[int, str] = {
-    1:  "New",
-    2:  "PartiallyFilled",
-    3:  "Filled",
-    5:  "Canceled",
-    8:  "Rejected",
-    10: "PendingNew",
-    12: "Expired",
-    15: "PendingTrigger",
-    16: "Triggered",
+    OrderStatus_New:             "New",
+    OrderStatus_PartiallyFilled: "PartiallyFilled",
+    OrderStatus_Filled:          "Filled",
+    OrderStatus_Canceled:        "Canceled",
+    OrderStatus_Rejected:        "Rejected",
+    OrderStatus_PendingNew:      "PendingNew",
+    OrderStatus_Expired:         "Expired",
 }
 
 
 def _exec_type_text(exec_type: int) -> str:
-    if exec_type == 15:
+    if exec_type == ExecType_Trade:
         return "Trade"
-    if exec_type == 19:
+    if exec_type == ExecType_CancelRejected:
         return "CancelRejected"
     return f"Exec{exec_type}"
 
