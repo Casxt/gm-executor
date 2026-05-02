@@ -1,0 +1,249 @@
+"""run_cycle and helpers — pass-1 cleanup, pass-2 reconcile, matched check.
+
+Stateless across runs: every cycle reads inputs fresh from broker + filesystem,
+computes a diff, acts, returns. An exception inside is just lost work; the next
+cycle reconciles whatever is now true.
+"""
+
+import logging
+import time
+from collections import defaultdict
+from pathlib import Path
+from typing import Any
+
+from gm.api import (
+    OrderSide_Buy,
+    OrderSide_Sell,
+    OrderType_Limit,
+    OrderType_Market,
+    PositionEffect_Open,
+    PositionSide_Long,
+    get_position,
+    get_unfinished_orders,
+    order_cancel,
+    order_volume,
+)
+
+from . import config, order_log, state
+from .models import BatchDoc
+from .schema import parse_and_validate
+
+log = logging.getLogger(__name__)
+
+
+# ── small helpers ─────────────────────────────────────────────────────
+
+def unix_now() -> int:
+    return int(time.time())
+
+
+def unix_now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+# ── cycle entry point ─────────────────────────────────────────────────
+
+def run_cycle() -> None:
+    if not state.trade_channel_up.is_set():
+        log.warning("skipping cycle: trade channel down")
+        return
+
+    now = unix_now()
+    positions, unfinished = _broker_snapshot()
+
+    seen, active = _pass_one(now, unfinished)
+    if _has_overlap(seen):
+        return                                          # invariant broken; operator must intervene
+    if not active:
+        log.info("idle: no active batch")
+        return
+
+    doc = active[0]
+    _reconcile(doc, positions, unfinished)
+    if _matched(doc, positions, unfinished):
+        log.info("matched: %s -> finished/", doc.batch_id)
+        order_log.move_pair(doc.batch_id, config.FINISHED_DIR)
+
+
+# ── pass 1: clean pending/ ────────────────────────────────────────────
+
+def _pass_one(now: int, unfinished: dict[str, list]) -> tuple[list[BatchDoc], list[BatchDoc]]:
+    seen:   list[BatchDoc] = []
+    active: list[BatchDoc] = []
+    for path in sorted(config.PENDING_DIR.glob("*.json")):
+        try:
+            doc = parse_and_validate(path)
+        except Exception:
+            log.exception("invalid batch %s -> failed/", path.name)
+            try:
+                order_log.move_invalid(path)
+            except Exception:
+                log.exception("failed to move invalid batch %s", path.name)
+            continue
+
+        if now > doc.expires_at:
+            log.info("expired: %s -> expired/", doc.batch_id)
+            _cancel_alive(doc.batch_id, unfinished)
+            order_log.move_pair(doc.batch_id, config.EXPIRED_DIR)
+            continue
+
+        seen.append(doc)
+        if now >= doc.valid_at:
+            active.append(doc)
+        else:
+            log.info("scheduled: %s valid_at=%d now=%d", doc.batch_id, doc.valid_at, now)
+
+    return seen, active
+
+
+def _has_overlap(seen: list[BatchDoc]) -> bool:
+    """True iff any two pending batches' [valid_at, expires_at] windows overlap.
+
+    After sorting by valid_at, adjacent-pair check suffices (if a doesn't overlap
+    its successor, it can't overlap any later one).
+    """
+    seen.sort(key=lambda d: d.valid_at)
+    for a, b in zip(seen, seen[1:]):
+        if a.expires_at >= b.valid_at:
+            log.error("overlap: %s <-> %s; operator must intervene",
+                      a.batch_id, b.batch_id)
+            return True
+    return False
+
+
+# ── pass 2: reconcile ─────────────────────────────────────────────────
+
+def _reconcile(doc: BatchDoc, positions: dict, unfinished: dict[str, list]) -> None:
+    own_cl_ord_ids = _own_cl_ord_ids(doc.batch_id)
+    long_side = int(PositionSide_Long)
+
+    for order in doc.orders:
+        try:
+            sym_unfinished = unfinished.get(order.symbol, [])
+            if sym_unfinished:
+                _handle_unfinished(order.symbol, sym_unfinished, own_cl_ord_ids)
+                continue
+
+            held = positions.get((order.symbol, long_side), 0)
+            diff = order.target - held
+            if diff == 0:
+                continue
+
+            _submit(doc.batch_id, order.id, order.symbol, diff,
+                    order.order_type, order.price)
+        except Exception:
+            log.exception("reconcile failed for %s/%s; will retry next cycle",
+                          doc.batch_id, order.id)
+
+
+def _handle_unfinished(symbol: str, sym_unfinished: list, own_cl_ord_ids: set[str]) -> None:
+    foreign = {o.cl_ord_id for o in sym_unfinished} - own_cl_ord_ids
+    if foreign:
+        log.error("foreign order on %s; skipping (cl_ord_ids=%s)", symbol, sorted(foreign))
+        return
+
+    log.info("waiting on own orders for %s (%d unfinished)", symbol, len(sym_unfinished))
+    now = unix_now()
+    for o in sym_unfinished:
+        created_at = getattr(o, "created_at", None)
+        if created_at is None:
+            continue
+        try:
+            age = now - int(created_at.timestamp())
+        except Exception:
+            continue
+        if age > config.STUCK_ORDER_SECONDS:
+            log.error("stuck order %s on %s for %ds", o.cl_ord_id, symbol, age)
+
+
+def _submit(batch_id: str, order_id: str, symbol: str, diff: int,
+            order_type_str: str, price: float | None) -> None:
+    side       = OrderSide_Buy if diff > 0 else OrderSide_Sell
+    side_text  = "buy"         if diff > 0 else "sell"
+    order_type = OrderType_Limit if order_type_str == "limit" else OrderType_Market
+    submit_price = float(price) if order_type_str == "limit" and price is not None else 0.0
+    volume = abs(diff)
+
+    log.info("submit: batch=%s symbol=%s vol=%d side=%s type=%s price=%s",
+             batch_id, symbol, volume, side_text, order_type_str, submit_price)
+
+    results = order_volume(
+        symbol=symbol, volume=volume,
+        side=side, order_type=order_type,
+        position_effect=PositionEffect_Open, price=submit_price,
+    ) or []
+
+    for r in results:
+        cl_ord_id = getattr(r, "cl_ord_id", None)
+        if not cl_ord_id:
+            log.error("order_volume returned a result without cl_ord_id: %r", r)
+            continue
+        order_log.append(batch_id, {
+            "ts_ms":      unix_now_ms(),
+            "event":      "submit",
+            "order_id":   order_id,
+            "symbol":     symbol,
+            "side":       side_text,
+            "volume":     volume,
+            "order_type": order_type_str,
+            "price":      submit_price if order_type_str == "limit" else 0,
+            "cl_ord_id":  cl_ord_id,
+        }, register_cl_ord_id=cl_ord_id)
+
+
+# ── matched ───────────────────────────────────────────────────────────
+
+def _matched(doc: BatchDoc, positions: dict, unfinished: dict[str, list]) -> bool:
+    long_side = int(PositionSide_Long)
+    own_cl_ord_ids = _own_cl_ord_ids(doc.batch_id)
+    for order in doc.orders:
+        if positions.get((order.symbol, long_side), 0) != order.target:
+            return False
+        for o in unfinished.get(order.symbol, []):
+            if o.cl_ord_id in own_cl_ord_ids:
+                return False
+    return True
+
+
+# ── cancel-on-expiry ──────────────────────────────────────────────────
+
+def _cancel_alive(batch_id: str, unfinished: dict[str, list]) -> None:
+    """Cancel still-open cl_ord_ids of `batch_id` and log one `cancel` event each."""
+    ours = [
+        o for orders in unfinished.values() for o in orders
+        if order_log.clord_index.get(o.cl_ord_id) == batch_id
+    ]
+    if not ours:
+        return
+
+    try:
+        order_cancel(ours)
+    except Exception:
+        log.exception("order_cancel failed for batch %s", batch_id)
+
+    for o in ours:
+        order_log.append(batch_id, {
+            "ts_ms":     unix_now_ms(),
+            "event":     "cancel",
+            "cl_ord_id": o.cl_ord_id,
+        })
+
+
+# ── shared bits ───────────────────────────────────────────────────────
+
+def _broker_snapshot() -> tuple[dict[tuple[str, int], int], dict[str, list]]:
+    positions: dict[tuple[str, int], int] = {}
+    for p in get_position() or []:
+        positions[(p.symbol, int(p.side))] = int(p.volume)
+
+    unfinished: dict[str, list] = defaultdict(list)
+    for o in get_unfinished_orders() or []:
+        unfinished[o.symbol].append(o)
+    return positions, unfinished
+
+
+def _own_cl_ord_ids(batch_id: str) -> set[str]:
+    return {
+        ev["cl_ord_id"] for ev in order_log.replay_record(batch_id)
+        if ev.get("event") == "submit" and isinstance(ev.get("cl_ord_id"), str)
+    }
