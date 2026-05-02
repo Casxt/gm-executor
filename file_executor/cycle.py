@@ -48,21 +48,26 @@ def run_cycle() -> None:
         log.warning("skipping cycle: trade channel down")
         return
 
-    now = unix_now()
-    positions, unfinished = _broker_snapshot()
+    # Held for the whole cycle: freeze pending/ against connector mirrors and
+    # against callback-driven path lookups for the duration of one reconcile.
+    # The lock is reentrant, so order_log.append / move_pair / replay_record
+    # below re-acquire it without contention.
+    with state.batch_state_lock:
+        now = unix_now()
+        positions, unfinished = _broker_snapshot()
 
-    seen, active = _pass_one(now, unfinished)
-    if _has_overlap(seen):
-        return                                          # invariant broken; operator must intervene
-    if not active:
-        log.info("idle: no active batch")
-        return
+        seen, active = _pass_one(now, unfinished)
+        if _has_overlap(seen):
+            return                                      # invariant broken; operator must intervene
+        if not active:
+            log.info("idle: no active batch")
+            return
 
-    doc = active[0]
-    _reconcile(doc, positions, unfinished)
-    if _matched(doc, positions, unfinished):
-        log.info("matched: %s -> finished/", doc.batch_id)
-        order_log.move_pair(doc.batch_id, config.FINISHED_DIR)
+        doc = active[0]
+        _reconcile(doc, positions, unfinished)
+        if _matched(doc, positions, unfinished):
+            log.info("matched: %s -> finished/", doc.batch_id)
+            order_log.move_pair(doc.batch_id, config.FINISHED_DIR)
 
 
 # ── pass 1: clean pending/ ────────────────────────────────────────────
@@ -173,11 +178,22 @@ def _submit(batch_id: str, order_id: str, symbol: str, diff: int,
         position_effect=PositionEffect_Open, price=submit_price,
     ) or []
 
+    if not results:
+        log.error("order_volume returned no orders for batch=%s order=%s symbol=%s — "
+                  "broker may still place the order, but we cannot track it",
+                  batch_id, order_id, symbol)
+        return
+
+    log.info("order_volume returned %d order(s) for batch=%s order=%s",
+             len(results), batch_id, order_id)
+
     for r in results:
         cl_ord_id = getattr(r, "cl_ord_id", None)
         if not cl_ord_id:
             log.error("order_volume returned a result without cl_ord_id: %r", r)
             continue
+        log.info("  registering cl_ord_id=%s for batch=%s order=%s",
+                 cl_ord_id, batch_id, order_id)
         order_log.append(batch_id, {
             "ts_ms":      unix_now_ms(),
             "event":      "submit",

@@ -26,9 +26,10 @@ Publisher contract (entirely owned by the algo side, not the connector):
 
 * writes batches **only** under `active_order/`,
 * removes a file from `active_order/` when the publisher considers it expired (housekeeping; the connector also filters by `expires_at` defensively),
-* never mutates a `<batch_id>.json` after the first commit. **`batch_id` is immutable** — a new idea always gets a new id.
+* never mutates `orders` (or any field that contributes to `batch_id`) after the first commit. **`batch_id` is the immutability boundary, not the file** — a new idea always gets a new id.
+* `expires_at` is the one mutable field, and **may only be reduced** (shrink TTL or kill outright by setting `expires_at ≤ now`). Extending a batch's life is forbidden — publish a new id instead.
 
-The connector trusts this contract and never enforces or repairs it.
+The connector enforces one piece of this contract — it refuses to mirror bytes with `valid_at >= expires_at` (logged + skipped). Everything else is the publisher's responsibility.
 
 ## Loop
 
@@ -51,30 +52,35 @@ def connector_loop(stop_event):
         try:    sync_repo()
         except Exception: log.exception("git sync failed")  # keep looping
 
-        seen = known_batch_ids()                         # snapshot of all 4 subdirs
         for path in glob(os.path.join(GIT_DIR, "active_order", "*.json")):
-            try:    doc = parse_minimal(path)            # batch_id, expires_at
+            try:    doc = parse_minimal(path)            # batch_id, valid_at, expires_at
             except Exception:
                 log.exception("bad batch in repo: %s", path); continue
 
-            if doc.batch_id in seen:               continue
+            if doc.valid_at >= doc.expires_at:     continue   # invalid; refuse + warn
             if unix_now() >= doc.expires_at:       continue   # already expired
-            atomic_copy(path, os.path.join(ORDERS, "pending", f"{doc.batch_id}.json"))
+
+            dst = os.path.join(ORDERS, "pending", f"{doc.batch_id}.json")
+            with batch_state_lock:
+                if is_terminal(doc.batch_id):      continue   # finalized; never resurrect
+                if file_bytes_equal(path, dst):    continue   # already mirrored
+                atomic_copy(path, dst)                        # creates or overwrites in place
 
         stop_event.wait(PULL_SEC)
 ```
 
-`atomic_copy(src, dst)` writes `dst + ".tmp"` then `os.replace(tmp, dst)`. On NTFS within the same volume the rename is atomic — the cycle's `glob("*.json")` never sees a partial file.
+`atomic_copy(src, dst)` writes `dst + ".tmp"` then `os.replace(tmp, dst)`. On NTFS within the same volume the rename is atomic — the cycle's `glob("*.json")` never sees a partial file, and a torn read of an in-flight overwrite is impossible.
 
-`known_batch_ids()` returns the set of basenames (minus `.json`) under the four subdirs. Anything in the set is skipped — already known to the executor in some state.
+**Mirror, not import-once.** Each pass re-syncs publisher content into `pending/`. Three skip rules: (1) `valid_at >= expires_at` ⇒ refuse + warn; (2) `batch_id` already in a terminal dir (`finished/`, `expired/`, `failed/`) ⇒ skip; (3) `pending/<batch_id>.json` already has identical bytes ⇒ no-op. Otherwise atomic-overwrite. This is what makes `expires_at` edits land: same `batch_id`, same filename, same identity — only the bytes differ, and the next cycle reads the new value through the normal `parse_and_validate` path.
 
-**Enumeration order matters: `pending/` first, then `finished/`, `expired/`, `failed/`.** The cycle only moves files **rightward** (out of `pending/` into a terminal dir, never the reverse), and `os.rename` on NTFS is atomic — at any instant the file is in exactly one directory. Given those two facts, this order makes the snapshot race-free:
+**Race vs. cycle, closed by the lock.** The cycle holds `batch_state_lock` for the *entire* `run_cycle` (reentrant — `append` / `move_pair` re-acquire freely). The connector takes the same lock per file around `is_terminal` + bytes-compare + `atomic_copy`. So:
 
-* if the iterator sees `X.json` in `pending/`, done;
-* if it doesn't, `X` was already moved out before `pending/` was scanned, so it's sitting in a terminal dir that we haven't scanned yet, and a later iteration will pick it up;
-* if the move happens **during** the snapshot (between the `pending/` and `finished/` iterations), the `pending/` scan still saw `X` because the rename hadn't happened when it ran.
+* if a cycle is running, the connector waits — no edit can land mid-reconcile, the cycle's view of `pending/` is frozen end-to-end;
+* if the connector is mirroring, the cycle's next tick waits — the connector finishes, releases, the cycle then sees the new bytes from a clean start.
 
-Reverse the order (terminal dirs first, `pending/` last) and the snapshot can miss a file: the cycle moves `X` from `pending/` to `finished/` after `finished/` has been scanned but before `pending/` is, and `X` ends up in neither set.
+There is no "phantom resurrection" window and no mid-cycle byte swap. The cycle's critical section is microseconds-to-milliseconds (broker calls already returned by the time the lock is held — `_broker_snapshot` runs inside the lock, so freshness is bounded by lock-acquire time, not by lock duration on the connector's side).
+
+**Why "shrink-only" matters.** Because `new ≤ old`, any edit on a "just expired" batch (`old ≤ now`, cycle hasn't moved yet) also satisfies `new ≤ now` — both interleavings (cycle moves first, or connector mirrors first then cycle moves) terminate in `expired/`. The outcome is unambiguous regardless of timing.
 
 ## Git
 
@@ -85,10 +91,11 @@ Reverse the order (terminal dirs first, `pending/` last) and the snapshot can mi
 
 ## Concurrency
 
-* Connector and cycle share `$GMX_ORDERS_DIR` but never the same operation: connector **creates** under `pending/`, cycle **moves out** of `pending/`. Both rely on `os.replace` / `os.rename` atomicity on NTFS. No lock between them is needed.
-* Snapshot correctness depends entirely on the enumeration order in `known_batch_ids()` (see above). The cycle only moves rightward, the connector enumerates rightward — so any concurrent move during the snapshot is guaranteed to be caught in either the source dir (if scanned before the move) or the destination dir (if scanned after).
-* Even if a stale `seen` snapshot somehow let a known `batch_id` re-enter `pending/`, the cycle would re-reconcile against the broker, find positions already satisfied, and move it back to `finished/` — wasteful but not unsafe. The order rule above closes this gap in practice; this is the fallback.
-* The connector never touches `*.order_record.jsonl`. Those are created by the cycle on first append.
+* Connector and cycle share `$GMX_ORDERS_DIR`. Connector **creates or overwrites** under `pending/`; cycle **moves out** of `pending/` into a terminal dir.
+* `state.batch_state_lock` (reentrant) serialises the two. The cycle holds it for the whole `run_cycle`; the connector holds it per file around `is_terminal(batch_id)` + `atomic_copy(...)`; `order_log.move_pair` / `move_invalid` re-enter it from the cycle thread. Result: a batch is, at any instant, observably in exactly one of `pending/` or a terminal dir, and no connector edit can change `pending/<id>.json` while a cycle is reconciling against it.
+* In-place overwrite of `pending/<id>.json` is safe even without the lock thanks to `os.replace` atomicity — the cycle's mid-tick read sees either the old or the new bytes, never a torn mix. The lock exists for the cross-directory transition, not for byte-level coherence.
+* The connector never touches `*.order_record.jsonl`. Those are created by the cycle on first append, and a re-mirror of the json side does not touch the record side — the order_record's binding is by `batch_id`, not by file content.
+* Lock order convention: `batch_state_lock` then `log_lock`, never the reverse. The connector only takes `batch_state_lock`, so it cannot deadlock against `append`/`replay_record`.
 
 ## Config (env)
 

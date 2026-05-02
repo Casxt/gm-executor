@@ -116,18 +116,18 @@ The SDK fires `on_xxx` callbacks on **its own threads**, asynchronously, at any 
 ### Locks
 
 * `log_lock` — serialises **writes** to any `order_record.jsonl`.
-* `log_move_lock` — serialises **path changes** (`move_pair`) and path lookups (`locate_record`).
-* Lock order: `log_move_lock` then `log_lock`. Never the reverse.
+* `batch_state_lock` — serialises **everything that observes or changes which directory a batch lives in**: cross-dir moves (`move_pair`, `move_invalid`), path lookups (`locate_record`), the connector's `is_terminal`+`atomic_copy`, and the entire `run_cycle` (cycle holds it for its full duration so no connector edit and no callback-driven path lookup can interleave). Reentrant — the cycle re-acquires it via `order_log` helpers.
+* Lock order: `batch_state_lock` then `log_lock`. Never the reverse.
 
 No `cycle_lock` — only `cycle_worker` runs the cycle, so two cycles can't overlap by construction.
 
 ### Wiring
 
 ```Python
-stop_event    = threading.Event()
-cycle_pending = threading.Event()
-log_lock      = threading.Lock()
-log_move_lock = threading.Lock()
+stop_event       = threading.Event()
+cycle_pending    = threading.Event()
+log_lock         = threading.Lock()
+batch_state_lock = threading.RLock()
 
 def init(context) -> None:
     set_token(GM_TOKEN)
@@ -179,7 +179,7 @@ def cycle_worker(stop_event: threading.Event, cycle_pending: threading.Event) ->
 * **Exponential backoff** capped at 60 s (`2, 4, 8, 16, 32, 60, 60, …`) — slow enough to stop flooding the log when the broker or disk is genuinely down, fast enough that the first transient blip costs only a couple of seconds.
 * **`stop_event.wait(backoff)`** instead of `time.sleep(backoff)` — shutdown wakes the worker immediately even while it's mid-backoff. Never sleep on a non-interruptible primitive inside a worker.
 
-All resources held during a cycle — `log_lock`, `log_move_lock`, file handles — **must** be acquired with `with`. An exception unwinding the stack must release them automatically. Stranding `log_lock` would freeze every callback that appends to `order_record.jsonl`, and the next cycle would see no order events arriving even though the broker is sending them. The existing `append()` and `replay()` already follow this rule; new I/O paths must too.
+All resources held during a cycle — `log_lock`, `batch_state_lock`, file handles — **must** be acquired with `with`. An exception unwinding the stack must release them automatically. Stranding `batch_state_lock` would freeze the connector and every callback that appends to `order_record.jsonl`. The existing `append()` and `replay()` already follow this rule; new I/O paths must too.
 
 Note what is **not** included: no thread-level supervisor wrapping `cycle_worker`. The worker can only die from a `BaseException` that `except Exception` doesn't catch (`SystemExit`, `KeyboardInterrupt`) — both indicate the process itself is shutting down, and a restarted worker on a dying interpreter would be more harmful than helpful. If a real bug somehow kills the worker, the operator sees cycles stop and restarts the process.
 
@@ -190,7 +190,7 @@ Three writers (cycle thread + both callbacks). Every append is durable on disk b
 ```Python
 def append(batch_id, event):
     line = json.dumps(event, separators=(",",":")) + "\n"
-    with log_move_lock:                          # path stable for this whole block
+    with batch_state_lock:                       # path stable for this whole block
         path = locate_record(batch_id)
         with log_lock:                           # exclusive writer
             with open(path, "a", encoding="utf-8") as f:
@@ -199,9 +199,9 @@ def append(batch_id, event):
                 os.fsync(f.fileno())             # OS page cache → disk
 ```
 
-`log_move_lock` is held for the whole block — `locate_record` does three `stat`s and we mustn't have a `move_pair` slip in between the lookup and the open (the path we found would no longer exist; on Windows, opening would also fail because the file got renamed). `log_lock` is the writer-exclusion lock; it spans only the open + write + fsync + close so concurrent appends serialise but slow `fsync`s don't block moves.
+`batch_state_lock` is held for the whole block — `locate_record` does three `stat`s and we mustn't have a `move_pair` (or a connector mirror) slip in between the lookup and the open. `log_lock` is the writer-exclusion lock; it spans only the open + write + fsync + close so concurrent appends serialise but slow `fsync`s don't block moves.
 
-`move_pair(batch_id, dst)` symmetrically acquires `log_move_lock` (and only that) for the rename.
+`move_pair(batch_id, dst)` symmetrically acquires `batch_state_lock` (and only that) for the rename. The connector's per-file mirror in `_import_pass` does the same. The cycle holds `batch_state_lock` for its entire `run_cycle` and re-enters here via `append`/`move_pair` thanks to its reentrant flavor.
 
 ### Routing — `cl_ord_id → batch_id → file path`
 
@@ -210,7 +210,7 @@ Callbacks have `cl_ord_id`. The map `clord_index: cl_ord_id → batch_id`:
 * **Startup** — `rebuild_clord_index()` scans every `*.order_record.jsonl` under `$GMX_ORDERS_DIR/{pending,finished,expired}/` for `submit` lines.
 * **Live** — each successful `order_volume(...)` registers its entry inside the same `log_lock` section as the `submit` write, so map and line update atomically.
 
-`locate_record(batch_id)` tries `pending/`, `finished/`, `expired/` and returns the first hit. Caller must hold `log_move_lock`. Miss ⇒ warn + drop (only possible after manual tampering).
+`locate_record(batch_id)` tries `pending/`, `finished/`, `expired/` and returns the first hit. Caller must hold `batch_state_lock`. Miss ⇒ warn + drop (only possible after manual tampering).
 
 ### Reading the log (replay)
 

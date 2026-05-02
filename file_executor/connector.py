@@ -1,4 +1,4 @@
-"""Git connector daemon: pulls a remote repo and copies new batches into pending/.
+"""Git connector daemon: pulls a remote repo and mirrors batches into pending/.
 
 Read-only on the repo: pulls (clone / fetch + reset --hard); never adds, modifies,
 deletes, or commits anything. The repo is the publisher's territory.
@@ -6,9 +6,10 @@ deletes, or commits anything. The repo is the publisher's territory.
 Atomic copy: write `<id>.json.tmp`, then `os.replace`. On NTFS within one volume
 this is atomic, so the cycle's `glob("*.json")` never sees a partial file.
 
-`known_batch_ids()` enumerates `pending/` first then the terminal dirs. The cycle
-only ever moves files rightward (out of `pending/`), and `os.rename` is atomic, so
-this order guarantees a moving file is caught in either its source or its destination.
+Mirror semantics (not import-once): every pass re-syncs `active_order/<batch_id>.json`
+into `pending/<batch_id>.json` if the bytes differ — supporting in-place edits to
+mutable fields (currently only `expires_at`). Batches already in finished/expired/failed
+are never re-imported — the cycle owns the terminal verdict.
 """
 
 import json
@@ -65,18 +66,15 @@ def _sync_repo() -> None:
 
 # ── snapshot ──────────────────────────────────────────────────────────
 
-def _known_batch_ids() -> set[str]:
-    """Basenames (minus .json) under pending/, finished/, expired/, failed/.
+def _is_terminal(batch_id: str) -> bool:
+    """True if `batch_id`.json sits under any of finished/, expired/, failed/.
 
-    Order matters: pending first, then terminal dirs (see CONNECTOR.md).
+    Caller MUST hold `batch_state_lock` to make this check coherent with the cycle.
     """
-    seen: set[str] = set()
-    for d in (config.PENDING_DIR, config.FINISHED_DIR, config.EXPIRED_DIR, config.FAILED_DIR):
-        if not d.exists():
-            continue
-        for path in d.glob("*.json"):
-            seen.add(path.stem)
-    return seen
+    for d in (config.FINISHED_DIR, config.EXPIRED_DIR, config.FAILED_DIR):
+        if (d / f"{batch_id}.json").exists():
+            return True
+    return False
 
 
 # ── copy ──────────────────────────────────────────────────────────────
@@ -88,10 +86,10 @@ def _atomic_copy(src: Path, dst: Path) -> None:
     os.replace(tmp, dst)
 
 
-def _peek_batch(path: Path) -> tuple[str, int]:
-    """Cheap read of just `batch_id` and `expires_at`. Schema validation happens later in the cycle."""
+def _peek_batch(path: Path) -> tuple[str, int, int]:
+    """Cheap read of `batch_id`, `valid_at`, `expires_at`. Full schema validation happens later in the cycle."""
     raw = json.loads(path.read_text(encoding="utf-8"))
-    return str(raw["batch_id"]), int(raw["expires_at"])
+    return str(raw["batch_id"]), int(raw["valid_at"]), int(raw["expires_at"])
 
 
 # ── loop ──────────────────────────────────────────────────────────────
@@ -121,28 +119,47 @@ def connector_loop() -> None:
 
 
 def _import_pass() -> None:
-    seen = _known_batch_ids()
-    now  = int(time.time())
+    """Mirror publisher's active_order/ into pending/.
+
+    Identity is `batch_id`, which hashes only `orders` — so the publisher may
+    edit `expires_at` (and only by *reducing* it; see CONNECTOR.md). The pass
+    treats the publisher's content as truth for any batch not already finalized:
+    identical bytes ⇒ no-op, different bytes ⇒ atomic overwrite.
+
+    Held under `batch_state_lock` per file so the cycle's `move_pair` / `move_invalid`
+    cannot interleave between the terminal-set check and the copy — eliminating
+    the "phantom resurrection" race.
+    """
+    now = int(time.time())
     src_dir = config.GIT_LOCAL_DIR / _ACTIVE_ORDER_DIRNAME
     if not src_dir.exists():
         return
 
     for path in src_dir.glob("*.json"):
         try:
-            batch_id, expires_at = _peek_batch(path)
+            batch_id, valid_at, expires_at = _peek_batch(path)
         except Exception:
             log.exception("connector: bad batch in repo: %s", path.name)
             continue
 
-        if batch_id in seen:
+        if valid_at >= expires_at:
+            log.warning("connector: refusing %s — valid_at(%d) >= expires_at(%d)",
+                        batch_id, valid_at, expires_at)
             continue
         if now >= expires_at:
             continue                                          # already expired
 
         dst = config.PENDING_DIR / f"{batch_id}.json"
         try:
-            _atomic_copy(path, dst)
-            log.info("connector: imported %s", batch_id)
+            with state.batch_state_lock:
+                if _is_terminal(batch_id):
+                    continue                                  # finalized; never resurrect
+                src_bytes = path.read_bytes()
+                if dst.exists() and dst.read_bytes() == src_bytes:
+                    continue                                  # already mirrored
+                existed = dst.exists()
+                _atomic_copy(path, dst)
+            log.info("connector: %s %s", "updated" if existed else "imported", batch_id)
         except Exception:
             log.exception("connector: copy failed for %s", batch_id)
 

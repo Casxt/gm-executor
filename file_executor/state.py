@@ -3,7 +3,7 @@
 Everything here is a module-level singleton. The only mutable container is
 `worker_threads`; everything else is a primitive that's safe to share.
 
-Lock order (never reverse): `log_move_lock` then `log_lock`.
+Lock order (never reverse): `batch_state_lock` then `log_lock`.
 """
 
 import threading
@@ -23,8 +23,20 @@ trade_channel_up.set()
 log_lock:      threading.Lock = threading.Lock()
 """Serialises *writes* to any order_record.jsonl. Brief — open→write→fsync→close."""
 
-log_move_lock: threading.Lock = threading.Lock()
-"""Serialises *path changes* (move_pair) and path lookups (locate_record)."""
+batch_state_lock: threading.RLock = threading.RLock()
+"""Serialises everything that observes or mutates **which directory each batch lives in**.
+
+Held by:
+- the cycle worker for the entire `run_cycle` (so its view of pending/ is stable —
+  no connector edit, no callback-driven move can interleave);
+- the connector around `is_terminal(batch_id)` + `atomic_copy` (so its mirror cannot
+  resurrect a freshly-finalized batch);
+- `order_log.move_pair` / `move_invalid` (cross-directory moves);
+- `order_log.append` / `replay_record` / `locate_record` (path lookups must agree
+  with whichever directory currently owns the batch).
+
+Reentrant so the cycle can call into `order_log` helpers while already holding it.
+"""
 
 # ── runtime ───────────────────────────────────────────────────────────
 worker_threads: list[threading.Thread] = []

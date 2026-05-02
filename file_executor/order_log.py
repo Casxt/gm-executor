@@ -2,14 +2,16 @@
 
 Concurrency rules from FLOW.md:
 
-* Writers (`append`) hold `log_move_lock` for the whole locate→open→write→fsync→close,
-  then briefly `log_lock` for write-exclusion. Lock order is `log_move_lock` then
+* Writers (`append`) hold `batch_state_lock` for the whole locate→open→write→fsync→close,
+  then briefly `log_lock` for write-exclusion. Lock order is `batch_state_lock` then
   `log_lock`; never the reverse.
 * Readers (`replay_record`) acquire both locks too, briefly, so they always observe a
   consistent file (no path-changes mid-read, no half-written line).
 * `clord_index` is mutated only inside the same `log_lock` section as the corresponding
   `submit` write — so the in-memory map and the on-disk record advance atomically.
-* `move_pair` only acquires `log_move_lock`. A slow `fsync` on `log_lock` cannot block it.
+* `move_pair` only acquires `batch_state_lock`. A slow `fsync` on `log_lock` cannot block it.
+* `batch_state_lock` is reentrant: the cycle worker holds it across the entire
+  `run_cycle`, then re-enters here via `append` / `replay_record` / `move_pair`.
 """
 
 import json
@@ -42,7 +44,7 @@ def _batch_path(batch_dir: Path, batch_id: str) -> Path:
 def locate_record(batch_id: str) -> Path | None:
     """First matching record file across pending/finished/expired/.
 
-    Caller MUST hold `log_move_lock`.
+    Caller MUST hold `batch_state_lock`.
     """
     for d in config.LIVE_DIRS:
         p = _record_path(d, batch_id)
@@ -62,7 +64,7 @@ def append(batch_id: str, event: dict[str, Any], *, register_cl_ord_id: str | No
     """
     line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
 
-    with state.log_move_lock:
+    with state.batch_state_lock:
         path = locate_record(batch_id)
         if path is None:
             if event.get("event") != "submit":
@@ -85,7 +87,7 @@ def append(batch_id: str, event: dict[str, Any], *, register_cl_ord_id: str | No
 
 def replay_record(batch_id: str) -> list[dict[str, Any]]:
     """All events for `batch_id`, in file order. Empty list if no record exists yet."""
-    with state.log_move_lock:
+    with state.batch_state_lock:
         path = locate_record(batch_id)
         if path is None:
             return []
@@ -112,7 +114,7 @@ def replay_record(batch_id: str) -> list[dict[str, Any]]:
 def move_pair(batch_id: str, dst: Path) -> None:
     """Move both <id>.json and <id>.order_record.jsonl to `dst`, if they exist."""
     dst.mkdir(parents=True, exist_ok=True)
-    with state.log_move_lock:
+    with state.batch_state_lock:
         for src_dir in config.LIVE_DIRS:
             if src_dir == dst:
                 continue
@@ -124,7 +126,8 @@ def move_pair(batch_id: str, dst: Path) -> None:
 def move_invalid(path: Path) -> None:
     """Move a batch that failed parse/validate to failed/. No record exists yet."""
     config.FAILED_DIR.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(path), str(config.FAILED_DIR / path.name))
+    with state.batch_state_lock:
+        shutil.move(str(path), str(config.FAILED_DIR / path.name))
 
 
 # ── clord_index rebuild ───────────────────────────────────────────────
