@@ -120,3 +120,7 @@ The cycle then cross-checks every "live" `cl_ord_id` against `get_unfinished_ord
 * **One file per batch.** Two batches never share a log.
 * **Filename is identity.** `<batch_id>.order_record.jsonl` matches `<batch_id>.json`.
 * **Out-of-order tolerant.** Any interleaving of writers is legal; replay reduces deterministically.
+
+## Durability
+
+`f.write(line); f.flush()` — **no `os.fsync`**. Crash loses ≤1 line, power-cut a few. The broker is the source of current truth (reconciled every cycle); the log is audit. On Windows + AV, fsync stalls 100ms–1s per write and the cycle holds `batch_state_lock` through it — measured 5-order cycle: ~25 s with fsync, ~1 s without.

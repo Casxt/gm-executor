@@ -2,7 +2,7 @@
 
 Concurrency rules from FLOW.md:
 
-* Writers (`append`) hold `batch_state_lock` for the whole locate→open→write→fsync→close,
+* Writers (`append`) hold `batch_state_lock` for the whole locate→open→write→close,
   then briefly `log_lock` for write-exclusion. Lock order is `batch_state_lock` then
   `log_lock`; never the reverse.
 * Readers (`replay_record`) acquire both locks too, briefly, so they always observe a
@@ -11,14 +11,14 @@ Concurrency rules from FLOW.md:
   the `callback-processor` daemon (also under `batch_state_lock`). Events delivered during a cycle
   sit in the SDK→drain queue until the cycle releases the lock, so the drain always observes a
   fully-committed `clord_index`. No race, no dropped events for our own orders.
-* `move_pair` only acquires `batch_state_lock`. A slow `fsync` on `log_lock` cannot block it.
+* No `os.fsync`: broker is source of truth, log is audit. Windows + AV makes fsync
+  multi-second and serialises the cycle. Crash loses ≤1 line; power-cut a few.
 * `batch_state_lock` is reentrant: the cycle worker holds it across the entire
   `run_cycle`, then re-enters here via `append` / `replay_record` / `move_pair`.
 """
 
 import json
 import logging
-import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -79,8 +79,7 @@ def append(batch_id: str, event: dict[str, Any]) -> None:
         with state.log_lock:
             with open(path, "a", encoding="utf-8") as f:
                 f.write(line)
-                f.flush()
-                os.fsync(f.fileno())
+                f.flush()                                        # no fsync — see ORDER_RECORD.md
 
 
 # ── replay ────────────────────────────────────────────────────────────
