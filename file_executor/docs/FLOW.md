@@ -77,7 +77,7 @@ _event_queue = queue.SimpleQueue()
 
 def on_order_status(context, order):
     try:
-        log.info("recv status: cl_ord_id=%s ...", order.cl_ord_id, ...)
+        log.debug("recv status: cl_ord_id=%s ...", order.cl_ord_id, ...)
         _event_queue.put({"kind": "status", "ts_ms": unix_now_ms(), ...})
     except Exception: log.exception("on_order_status enqueue failed")
 

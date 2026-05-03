@@ -78,8 +78,8 @@ def on_order_status(context, order) -> None:
         cl_ord_id = order.cl_ord_id
         symbol    = getattr(order, "symbol", "") or ""
         status    = int(order.status)
-        log.info("recv status: cl_ord_id=%s symbol=%s status=%d (%s)",
-                 cl_ord_id, symbol, status, _STATUS_TEXTS.get(status, f"Status{status}"))
+        log.debug("recv status: cl_ord_id=%s symbol=%s status=%d (%s)",
+                  cl_ord_id, symbol, status, _STATUS_TEXTS.get(status, f"Status{status}"))
         _event_queue.put({
             "kind":                  "status",
             "ts_ms":                 unix_now_ms(),
@@ -99,8 +99,8 @@ def on_execution_report(context, execrpt) -> None:
         cl_ord_id = execrpt.cl_ord_id
         symbol    = getattr(execrpt, "symbol", "") or ""
         exec_type = int(execrpt.exec_type)
-        log.info("recv execrpt: cl_ord_id=%s symbol=%s exec_type=%d (%s)",
-                 cl_ord_id, symbol, exec_type, _exec_type_text(exec_type))
+        log.debug("recv execrpt: cl_ord_id=%s symbol=%s exec_type=%d (%s)",
+                  cl_ord_id, symbol, exec_type, _exec_type_text(exec_type))
         snap: dict = {
             "kind":            "execrpt",
             "ts_ms":           unix_now_ms(),
