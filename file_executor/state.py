@@ -20,10 +20,12 @@ trade_channel_up: threading.Event = threading.Event()
 trade_channel_up.set()
 
 trade_channel_up_at: float = 0.0
-"""`time.time()` of the most recent `on_trade_data_connected` callback. The cycle
-skips while `now - trade_channel_up_at < RECONNECT_GRACE_SECONDS` to let the
-reconnect replay storm settle (FLOW.md "Reconnect replay"). 0.0 ⇒ no callback yet,
-optimistic flag governs."""
+"""`time.time()` of last `on_trade_data_connected`. Cycle skips while within
+CYCLE_GRACE_SECONDS to let replay settle. 0.0 ⇒ no callback yet."""
+
+last_cycle_end_at: float = 0.0
+"""`time.time()` at end of last `run_cycle`. Cycle skips while within
+CYCLE_GRACE_SECONDS so other threads get uncontended time. 0.0 ⇒ no cycle yet."""
 
 # ── locks ─────────────────────────────────────────────────────────────
 log_lock:      threading.Lock = threading.Lock()

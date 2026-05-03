@@ -18,13 +18,11 @@ Required env: `GM_TOKEN`. Optional: `GMX_ORDERS_DIR`, `GMX_POLL_SECONDS`,
 import logging
 import os
 import sys
-from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
-from queue import SimpleQueue
 
 from gm.api import MODE_LIVE, run, set_token, stop, timer
 
 from file_executor import callbacks as _cb
-from file_executor import bench, config, connector, order_log, remote_log, state, worker
+from file_executor import bench, config, connector, local_log, order_log, remote_log, state, worker
 
 # ── SDK callback bindings (module-level so the SDK's importer sees them) ─
 on_timer                    = _cb.on_timer
@@ -39,58 +37,6 @@ on_error                    = _cb.on_error
 
 
 log = logging.getLogger("file_executor")
-_local_log_listener: QueueListener | None = None
-_local_log_handlers: list[logging.Handler] = []
-
-
-def _setup_local_logging() -> None:
-    global _local_log_handlers, _local_log_listener
-
-    _stop_local_logging()
-
-    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    formatter = logging.Formatter(fmt)
-
-    console = logging.StreamHandler(sys.stderr)
-    console.setLevel(logging.INFO)
-    console.setFormatter(formatter)
-
-    config.LOG_DIR.mkdir(parents=True, exist_ok=True)
-    file_handler = RotatingFileHandler(
-        config.LOG_DIR / config.LOG_FILE,
-        maxBytes=config.LOG_MAX_BYTES,
-        backupCount=config.LOG_BACKUP_COUNT,
-        encoding="utf-8",
-    )
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(formatter)
-
-    q = SimpleQueue()
-    queue_handler = QueueHandler(q)
-    queue_handler.setLevel(logging.INFO)
-
-    root = logging.getLogger()
-    for old_handler in root.handlers[:]:
-        root.removeHandler(old_handler)
-    root.setLevel(logging.INFO)
-    root.addHandler(queue_handler)
-
-    _local_log_listener = QueueListener(
-        q, console, file_handler, respect_handler_level=True,
-    )
-    _local_log_handlers = [console, file_handler]
-    _local_log_listener.start()
-
-
-def _stop_local_logging() -> None:
-    global _local_log_handlers, _local_log_listener
-    if _local_log_listener is None:
-        return
-    _local_log_listener.stop()
-    _local_log_listener = None
-    for handler in _local_log_handlers:
-        handler.close()
-    _local_log_handlers = []
 
 
 def init(context) -> None:
@@ -120,7 +66,7 @@ def init(context) -> None:
 
 
 def main() -> None:
-    _setup_local_logging()
+    local_log.start()
     remote_log.start()
 
     if not config.GM_TOKEN:
@@ -163,7 +109,7 @@ def _shutdown() -> None:
     except Exception:
         log.exception("gm.stop() failed")
     finally:
-        _stop_local_logging()
+        local_log.stop()
 
 
 if __name__ == "__main__":

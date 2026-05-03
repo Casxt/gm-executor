@@ -66,15 +66,19 @@ def run_cycle() -> None:
         log.warning("skipping cycle: trade channel down")
         return
 
-    # Reconnect grace: skip for RECONNECT_GRACE_SECONDS after every
-    # `on_trade_data_connected` so the broker's status-replay storm settles
-    # before we trust the position/unfinished snapshot. trade_channel_up_at == 0.0
-    # ⇒ no callback yet (cold-start optimistic flag); skip the gate.
+    # Skip while within CYCLE_GRACE_SECONDS of last reconnect (let replay settle)
+    # or last cycle end (let drain/connector breathe). 0.0 ⇒ no event yet.
     if state.trade_channel_up_at > 0:
         elapsed = time.time() - state.trade_channel_up_at
-        if elapsed < config.RECONNECT_GRACE_SECONDS:
+        if elapsed < config.CYCLE_GRACE_SECONDS:
             log.info("skipping cycle: reconnect grace (%.1fs of %ds)",
-                     elapsed, config.RECONNECT_GRACE_SECONDS)
+                     elapsed, config.CYCLE_GRACE_SECONDS)
+            return
+    if state.last_cycle_end_at > 0:
+        elapsed = time.time() - state.last_cycle_end_at
+        if elapsed < config.CYCLE_GRACE_SECONDS:
+            log.info("skipping cycle: min gap (%.1fs of %ds)",
+                     elapsed, config.CYCLE_GRACE_SECONDS)
             return
 
     # Held for the whole cycle so connector mirrors and callback-driven path
@@ -107,6 +111,7 @@ def run_cycle() -> None:
             order_log.move_pair(doc.batch_id, config.FINISHED_DIR)
     finally:
         state.batch_state_lock.release()
+        state.last_cycle_end_at = time.time()
 
 
 # ── pass 1: clean pending/ ────────────────────────────────────────────

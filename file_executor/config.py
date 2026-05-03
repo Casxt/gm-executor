@@ -30,9 +30,9 @@ POLL_INTERVAL_MS: int = POLL_SECONDS * 1000
 STUCK_ORDER_SECONDS: int = 600
 """Per FLOW.md: log error when an own unfinished order has been on the book this long."""
 
-RECONNECT_GRACE_SECONDS: int = int(os.environ.get("GMX_RECONNECT_GRACE_SECONDS", "30"))
-"""Cycle skips for this long after every `on_trade_data_connected` so the broker's
-status-replay storm settles before we trust position/unfinished snapshots."""
+CYCLE_GRACE_SECONDS: int = int(os.environ.get("GMX_CYCLE_GRACE_SECONDS", "30"))
+"""Skip window after each `on_trade_data_connected` (let replay settle) AND min
+gap between cycles (let drain/connector/SDK threads breathe)."""
 
 # ── connector ─────────────────────────────────────────────────────────
 GIT_REPO_URL: str    = os.environ.get("GMX_GIT_REPO_URL", "")

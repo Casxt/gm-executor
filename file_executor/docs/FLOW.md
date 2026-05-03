@@ -127,12 +127,17 @@ def run_cycle():
     if not trade_channel_up.is_set():
         log.warning("skipping cycle: trade channel down"); return
     if state.trade_channel_up_at > 0 \
-       and time.time() - state.trade_channel_up_at < RECONNECT_GRACE_SECONDS:
+       and time.time() - state.trade_channel_up_at < CYCLE_GRACE_SECONDS:
         log.info("skipping cycle: reconnect grace ..."); return    # see "Reconnect replay"
+    if state.last_cycle_end_at > 0 \
+       and time.time() - state.last_cycle_end_at < CYCLE_GRACE_SECONDS:
+        log.info("skipping cycle: min gap ..."); return            # let drain/connector breathe
     ...
 ```
 
-`trade_channel_up_at` is stamped on every `on_trade_data_connected` callback — both the first connect and every reconnect. While `now - trade_channel_up_at < RECONNECT_GRACE_SECONDS`, the cycle skips. This costs one cycle at cold start (acceptable) and gives the broker time to finish replaying the status burst after a reconnect (essential).
+`trade_channel_up_at` is stamped on every `on_trade_data_connected`. While within `CYCLE_GRACE_SECONDS`, the cycle skips — costs one cycle at cold start, lets reconnect replay settle.
+
+`last_cycle_end_at` is stamped at every cycle end. Same window enforces a min gap so other threads get uncontended time when a cycle exceeds the timer interval.
 
 ## Reconnect replay
 
@@ -179,4 +184,4 @@ In-flight orders are **never** cancelled at shutdown. The broker keeps them; on 
 | `GM_ACCOUNT_ID`    | no       | —          | default when a batch omits `account_id`              |
 | `GMX_ORDERS_DIR`   | no       | `./orders` | orders root for `pending/`, `finished/`, `expired/`, `failed/` |
 | `GMX_POLL_SECONDS` | no       | `30`       | timer interval                                       |
-| `GMX_RECONNECT_GRACE_SECONDS` | no | `30` | cycle skip window after each `on_trade_data_connected` |
+| `GMX_CYCLE_GRACE_SECONDS` | no | `30` | cycle skip window after each `on_trade_data_connected` AND min gap between cycles |
