@@ -1,102 +1,117 @@
 # Remote Logging
 
-A `logging.Handler` that ships log records to one or more Feishu bot webhooks via a background relay thread. **`emit()` never blocks** — `queue.put_nowait` and return.
+A `logging.Handler` that ships WARNING+ records to one or more Feishu bot webhooks via a **subprocess**. `emit()` writes one JSON line to the relay's stdin and returns.
 
 ```
-log.warning(...)  ──▶  queue.Queue (bounded)  ──▶  relay thread  ──every 30s──▶  POST batch to each webhook
+log.warning(...)  ──▶  emit()  ──json line──▶  feishu_relay stdin
+                                                    │
+                                                    ▼ every 30s
+                                              POST batch to each webhook
 ```
 
-The HTTP round-trip is fully on the relay thread; trading flow is unaffected even if Feishu is unreachable.
+The HTTP round-trip lives entirely in the subprocess. A hung webhook, a stuck `requests` call, or any failure inside the HTTP stack cannot stall, lock, or leak into the trading process.
+
+## Why a subprocess
+
+Earlier this was a daemon thread. Two reasons it became a subprocess:
+
+* **Process isolation.** Network I/O, TLS, and `requests` retry/timeout edges have nothing to do with order placement. Putting them in a separate process means a webhook problem cannot reach the trading code at all — not via GIL, not via memory, not via uncaught exceptions.
+* **Operational simplicity.** The relay can be killed and restarted without touching the executor.
 
 ## Aggregation
 
-* Relay sleeps `TICK_SEC` (default 30s) via `stop_event.wait(TICK_SEC)`.
-* Per tick: drain queue, format all records into one Feishu message, POST to every webhook. Empty tick ⇒ no POST.
-* Worst-case per-record latency is one tick — deliberate trade-off to stay under Feishu's ~5/sec, ~100/min rate limit.
+* Subprocess flushes every `TICK_SEC` (default 30s).
+* Per tick: drain everything currently in its in-memory queue, format into one Feishu message, POST to every webhook. Empty tick ⇒ no POST.
+* Worst-case per-record delivery latency is one tick. Keeps us under Feishu's ~5/sec, ~100/min bot rate limit.
 
-## Loop
+## Subprocess (`feishu_relay.py`)
 
 ```python
-WEBHOOKS  = [u for u in os.environ.get("GMX_FEISHU_WEBHOOKS", "").split(",") if u]
-TICK_SEC  = int(os.environ.get("GMX_REMOTE_LOG_INTERVAL", "30"))
-QUEUE_MAX = int(os.environ.get("GMX_REMOTE_LOG_QUEUE_MAX", "10000"))
-SIZE_CAP  = 25 * 1024                                # bytes per message (Feishu ~30KB cap)
+# python -m file_executor.feishu_relay <url> [<url> ...]
 
-local_log = logging.getLogger("remote_logging.internal")
-local_log.propagate = False                          # MUST stay False — root would loop back into FeishuHandler
+q  = queue.SimpleQueue()
+eof = threading.Event()
 
+def reader():
+    for raw in sys.stdin:                           # blocks; releases GIL on read
+        q.put(json.loads(raw))
+    eof.set()
+
+threading.Thread(target=reader, daemon=True).start()
+
+while True:
+    deadline = time.monotonic() + TICK_SEC
+    records  = []
+    while (wait := deadline - time.monotonic()) > 0:
+        try: records.append(q.get(timeout=wait))
+        except queue.Empty: break
+
+    if records:
+        text = format_batch(records)                # truncated at SIZE_CAP
+        for url in webhooks:
+            try: requests.post(url, json={"msg_type":"text","content":{"text":text}}, timeout=5)
+            except Exception as e: print(f"POST failed: {e!r}", file=sys.stderr)
+
+    if eof.is_set() and q.empty(): return 0          # parent closed stdin → drain → exit
+```
+
+Two threads inside the subprocess (reader + main). They are *inside the subprocess*, so they do not contend with the trading process's GIL.
+
+## Handler (`remote_log.py`)
+
+```python
 class FeishuHandler(logging.Handler):
-    def __init__(self):
-        super().__init__()
-        self.q = queue.Queue(maxsize=QUEUE_MAX)
-        self.dropped = 0
-
+    def __init__(self, proc): self.proc = proc; super().__init__()
     def emit(self, record):
-        try: self.q.put_nowait(record)
-        except queue.Full: self.dropped += 1         # surfaced in next flush trailer
+        line = json.dumps({"level": record.levelname,
+                           "ts":    time.strftime("%H:%M:%S", time.localtime(record.created)),
+                           "name":  record.name,
+                           "msg":   record.getMessage()}, ensure_ascii=False) + "\n"
+        try:
+            self.proc.stdin.write(line); self.proc.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass                                        # relay died; drop silently
 
-def relay_loop(handler, stop_event):
-    while not stop_event.is_set():
-        records = []
-        while True:
-            try: records.append(handler.q.get_nowait())
-            except queue.Empty: break
+def start():
+    if not FEISHU_WEBHOOKS: return None
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "file_executor.feishu_relay", *FEISHU_WEBHOOKS],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=sys.stderr,
+        text=True, encoding="utf-8", bufsize=1,
+    )
+    h = FeishuHandler(proc); h.setLevel(logging.WARNING)
+    logging.getLogger().addHandler(h)
+    return proc
 
-        dropped, handler.dropped = handler.dropped, 0
-        if records or dropped:
-            text = format_batch(records, dropped)
-            for url in WEBHOOKS:
-                try: requests.post(url, json={"msg_type":"text","content":{"text":text}}, timeout=5)
-                except Exception: local_log.exception("feishu POST failed (%s...)", url[:40])
-
-        stop_event.wait(TICK_SEC)
+def stop():
+    proc.stdin.close()                                  # EOF wakes the reader
+    proc.wait(timeout=10)                               # else proc.kill()
 ```
 
-`format_batch` produces `[LEVEL] HH:MM:SS logger: msg` per record, truncates at `SIZE_CAP` with a trailer, and appends `(N records dropped)` if any.
-
-## Setup
-
-```python
-def init_remote_logging(stop_event):
-    if not WEBHOOKS:
-        local_log.info("GMX_FEISHU_WEBHOOKS empty; remote logging disabled")
-        return None
-
-    handler = FeishuHandler()
-    handler.setLevel(logging.WARNING)                # only WARN+ goes remote
-    logging.getLogger().addHandler(handler)
-
-    t = threading.Thread(target=relay_loop, args=(handler, stop_event),
-                         name="remote-log-relay", daemon=True)
-    t.start()
-    return t
-```
-
-Local stderr/file handlers stay attached and receive every level — remote is an addition, not a replacement.
+`bufsize=1` (line-buffered) means each `flush()` ships one line through the OS pipe (default ~64 KB buffer). At WARNING-rate this never fills.
 
 ## Config (env)
 
-| var                        | default | meaning                                                   |
-| -------------------------- | ------- | --------------------------------------------------------- |
-| `GMX_FEISHU_WEBHOOKS`      | empty   | comma-separated webhook URLs. Empty ⇒ remote disabled.    |
-| `GMX_REMOTE_LOG_INTERVAL`  | `30`    | seconds between flushes.                                  |
-| `GMX_REMOTE_LOG_QUEUE_MAX` | `10000` | max queued records; overflow is dropped + counted.        |
+| var                       | default | meaning                                             |
+| ------------------------- | ------- | --------------------------------------------------- |
+| `GMX_FEISHU_WEBHOOKS`     | empty   | comma-separated webhook URLs. Empty ⇒ relay not spawned. |
+| `GMX_REMOTE_LOG_INTERVAL` | `30`    | seconds between flushes (set in subprocess env).    |
 
 ## Failure handling
 
-| event                        | action                                                                  |
-| ---------------------------- | ----------------------------------------------------------------------- |
-| no webhooks configured       | handler not attached, relay not started; trading flow unaffected        |
-| queue full                   | `emit()` drops silently, increments `dropped`; next flush appends trailer |
-| webhook HTTP error / timeout | log via `remote_logging.internal`; skip that webhook; others still POSTed |
-| webhook 429/5xx              | same; don't retry inside the tick (would extend next batch's latency)   |
-| message > `SIZE_CAP`         | truncate at boundary, append `... (N more lines truncated)`             |
-| relay thread crashes         | unhandled exception kills the daemon; relay stays dead until restart    |
+| event                        | action                                                           |
+| ---------------------------- | ---------------------------------------------------------------- |
+| no webhooks configured       | relay not spawned; handler not attached                          |
+| relay subprocess crashes     | `emit()` writes hit `BrokenPipeError`; dropped silently. No restart — operator notices via stderr. |
+| webhook HTTP error / timeout | logged to subprocess stderr (visible in main log); skip that URL |
+| webhook 429 / 5xx            | same; no retry within tick                                       |
+| message > SIZE_CAP           | truncated with `... (N more lines truncated)` trailer            |
+| pipe buffer full             | `emit()` blocks on `stdin.write` until subprocess drains. Sized so this is unreachable at WARNING rate; if it happens, that's a bug. |
+| executor shutdown            | `remote_log.stop()` closes stdin → relay drains queue → exits    |
 
 ## Pitfalls
 
-* **Recursion is the easy bug.** `local_log.propagate = False` keeps HTTP-failure logs from looping back through root → `FeishuHandler`. Don't change that.
-* **Webhook URLs are secrets.** Path contains a Feishu-issued token. Never log full URLs — log a `url[:40]` prefix only.
-* **Don't ship INFO remote.** Default `WARNING`. INFO at 30s aggregation fills `SIZE_CAP` fast and crowds out signal.
-* **Keep `emit` dumb.** No formatting, filtering, or retries inside `emit` — strictly `put_nowait`. Anything else risks blocking the caller.
-* **Startup ordering.** Attach remote handler **after** local handlers, so startup logs reach stderr regardless of relay readiness.
+* **Don't log INFO remote.** Default WARNING. INFO at 30s aggregation fills SIZE_CAP fast and crowds out signal.
+* **Webhook URLs are secrets.** The path contains a Feishu-issued token. Subprocess only logs `url[:40]` prefixes on POST failure.
+* **Recursion.** `local_log.propagate = False` keeps internal failures from looping back through root → `FeishuHandler`. Don't change that.
+* **Startup ordering.** Spawn the relay (and attach handler) **after** local handlers, so stdout/stderr always sees the early lines regardless of relay state.

@@ -73,7 +73,9 @@ def run_cycle() -> None:
         now = unix_now()
         positions, unfinished = _broker_snapshot()
 
-        seen, active = _pass_one(now, unfinished)
+        with timed("pass_one") as f:
+            seen, active = _pass_one(now, unfinished)
+            f["seen"] = len(seen); f["active"] = len(active)
         if _has_overlap(seen):
             return                                      # invariant broken; operator must intervene
         if not active:
@@ -81,8 +83,13 @@ def run_cycle() -> None:
             return
 
         doc = active[0]
-        _reconcile(doc, positions, unfinished)
-        if _matched(doc, positions, unfinished):
+        with timed("reconcile") as f:
+            f["batch"] = doc.batch_id; f["orders"] = len(doc.orders)
+            _reconcile(doc, positions, unfinished)
+        with timed("matched_check") as f:
+            f["batch"] = doc.batch_id
+            done = _matched(doc, positions, unfinished)
+        if done:
             log.info("matched: %s -> finished/", doc.batch_id)
             order_log.move_pair(doc.batch_id, config.FINISHED_DIR)
 
@@ -136,23 +143,27 @@ def _has_overlap(seen: list[BatchDoc]) -> bool:
 # ── pass 2: reconcile ─────────────────────────────────────────────────
 
 def _reconcile(doc: BatchDoc, positions: dict, unfinished: dict[str, list]) -> None:
-    own_cl_ord_ids = _own_cl_ord_ids(doc.batch_id)
+    with timed("own_cl_ord_ids") as f:
+        own_cl_ord_ids = _own_cl_ord_ids(doc.batch_id)
+        f["batch"] = doc.batch_id; f["n"] = len(own_cl_ord_ids)
     long_side = int(PositionSide_Long)
 
     for order in doc.orders:
         try:
-            sym_unfinished = unfinished.get(order.symbol, [])
-            if sym_unfinished:
-                _handle_unfinished(order.symbol, sym_unfinished, own_cl_ord_ids)
-                continue
+            with timed("reconcile_order") as f:
+                f["symbol"] = order.symbol
+                sym_unfinished = unfinished.get(order.symbol, [])
+                if sym_unfinished:
+                    _handle_unfinished(order.symbol, sym_unfinished, own_cl_ord_ids)
+                    continue
 
-            held = positions.get((order.symbol, long_side), 0)
-            diff = order.target - held
-            if diff == 0:
-                continue
+                held = positions.get((order.symbol, long_side), 0)
+                diff = order.target - held
+                if diff == 0:
+                    continue
 
-            _submit(doc.batch_id, order.id, order.symbol, diff,
-                    order.order_type, order.price)
+                _submit(doc.batch_id, order.id, order.symbol, diff,
+                        order.order_type, order.price)
         except Exception:
             log.exception("reconcile failed for %s/%s; will retry next cycle",
                           doc.batch_id, order.id)
@@ -216,18 +227,20 @@ def _submit(batch_id: str, order_id: str, symbol: str, diff: int,
         order_log.clord_index[cl_ord_id] = batch_id
         log.info("  registering cl_ord_id=%s for batch=%s order=%s",
                  cl_ord_id, batch_id, order_id)
-        order_log.append(batch_id, {
-            "ts_ms":           unix_now_ms(),
-            "event":           "submit",
-            "order_id":        order_id,
-            "symbol":          symbol,
-            "side":            side_text,
-            "position_effect": pos_effect_text,
-            "volume":          volume,
-            "order_type":      order_type_str,
-            "price":           submit_price if order_type_str == "limit" else 0,
-            "cl_ord_id":       cl_ord_id,
-        })
+        with timed("append_submit") as f:
+            f["batch"] = batch_id; f["symbol"] = symbol
+            order_log.append(batch_id, {
+                "ts_ms":           unix_now_ms(),
+                "event":           "submit",
+                "order_id":        order_id,
+                "symbol":          symbol,
+                "side":            side_text,
+                "position_effect": pos_effect_text,
+                "volume":          volume,
+                "order_type":      order_type_str,
+                "price":           submit_price if order_type_str == "limit" else 0,
+                "cl_ord_id":       cl_ord_id,
+            })
 
 
 # ── matched ───────────────────────────────────────────────────────────

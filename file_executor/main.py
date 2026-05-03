@@ -107,6 +107,10 @@ def _shutdown() -> None:
     for t in state.worker_threads:
         t.join(timeout=10)
     try:
+        remote_log.stop()                                     # close relay stdin → drain → exit
+    except Exception:
+        log.exception("remote_log.stop() failed")
+    try:
         stop()
     except Exception:
         log.exception("gm.stop() failed")
