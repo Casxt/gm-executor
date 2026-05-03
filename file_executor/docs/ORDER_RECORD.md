@@ -123,4 +123,8 @@ The cycle then cross-checks every "live" `cl_ord_id` against `get_unfinished_ord
 
 ## Durability
 
-`f.write(line); f.flush()` — **no `os.fsync`**. Crash loses ≤1 line, power-cut a few. The broker is the source of current truth (reconciled every cycle); the log is audit. On Windows + AV, fsync stalls 100ms–1s per write and the cycle holds `batch_state_lock` through it — measured 5-order cycle: ~25 s with fsync, ~1 s without.
+`f.write(line)` only — **no `os.fsync`, no explicit `flush`**. `close()` flushes Python's userspace buffer to the OS, so a crash never loses an already-written line; power-cut may lose a few. The broker is the source of current truth (reconciled every cycle); the log is audit.
+
+## File-IO shape
+
+The cycle worker uses `order_log.cycle_session(batch_id)` — one open fd held across all appends in one cycle, closed at cycle end. The callback-drain path uses `order_log.append(batch_id, event)` — open/write/close per event. See [FLOW.md § Per-cycle log writes](./FLOW.md) for the rationale (cloud-disk metadata-IOPS throttling, 2026-05-03 measurement).

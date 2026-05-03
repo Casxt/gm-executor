@@ -171,25 +171,29 @@ def _reconcile(doc: BatchDoc, positions: dict, unfinished: dict[str, list]) -> N
         f["batch"] = doc.batch_id; f["n"] = len(own_cl_ord_ids)
     long_side = int(PositionSide_Long)
 
-    for order in doc.orders:
-        try:
-            with timed("reconcile_order") as f:
-                f["symbol"] = order.symbol
-                sym_unfinished = unfinished.get(order.symbol, [])
-                if sym_unfinished:
-                    _handle_unfinished(order.symbol, sym_unfinished, own_cl_ord_ids)
-                    continue
+    # One open fd for all submit-line appends in this cycle. Lazy: opens on
+    # first write, so a no-op cycle pays zero file-IO. Saves ~1010ms × N
+    # bucket waits on the throttled cloud disk vs. open/close-per-append.
+    with order_log.cycle_session(doc.batch_id) as session:
+        for order in doc.orders:
+            try:
+                with timed("reconcile_order") as f:
+                    f["symbol"] = order.symbol
+                    sym_unfinished = unfinished.get(order.symbol, [])
+                    if sym_unfinished:
+                        _handle_unfinished(order.symbol, sym_unfinished, own_cl_ord_ids)
+                        continue
 
-                held = positions.get((order.symbol, long_side), 0)
-                diff = order.target - held
-                if diff == 0:
-                    continue
+                    held = positions.get((order.symbol, long_side), 0)
+                    diff = order.target - held
+                    if diff == 0:
+                        continue
 
-                _submit(doc.batch_id, order.id, order.symbol, diff,
-                        order.order_type, order.price)
-        except Exception:
-            log.exception("reconcile failed for %s/%s; will retry next cycle",
-                          doc.batch_id, order.id)
+                    _submit(session, doc.batch_id, order.id, order.symbol, diff,
+                            order.order_type, order.price)
+            except Exception:
+                log.exception("reconcile failed for %s/%s; will retry next cycle",
+                              doc.batch_id, order.id)
 
 
 def _handle_unfinished(symbol: str, sym_unfinished: list, own_cl_ord_ids: set[str]) -> None:
@@ -212,7 +216,8 @@ def _handle_unfinished(symbol: str, sym_unfinished: list, own_cl_ord_ids: set[st
             log.error("stuck order %s on %s for %ds", o.cl_ord_id, symbol, age)
 
 
-def _submit(batch_id: str, order_id: str, symbol: str, diff: int,
+def _submit(session: "order_log._Session",
+            batch_id: str, order_id: str, symbol: str, diff: int,
             order_type_str: str, price: float | None) -> None:
     buy             = diff > 0
     side            = OrderSide_Buy        if buy else OrderSide_Sell
@@ -250,20 +255,18 @@ def _submit(batch_id: str, order_id: str, symbol: str, diff: int,
         order_log.clord_index[cl_ord_id] = batch_id
         log.info("  registering cl_ord_id=%s for batch=%s order=%s",
                  cl_ord_id, batch_id, order_id)
-        with timed("append_submit") as f:
-            f["batch"] = batch_id; f["symbol"] = symbol
-            order_log.append(batch_id, {
-                "ts_ms":           unix_now_ms(),
-                "event":           "submit",
-                "order_id":        order_id,
-                "symbol":          symbol,
-                "side":            side_text,
-                "position_effect": pos_effect_text,
-                "volume":          volume,
-                "order_type":      order_type_str,
-                "price":           submit_price if order_type_str == "limit" else 0,
-                "cl_ord_id":       cl_ord_id,
-            })
+        session.append({
+            "ts_ms":           unix_now_ms(),
+            "event":           "submit",
+            "order_id":        order_id,
+            "symbol":          symbol,
+            "side":            side_text,
+            "position_effect": pos_effect_text,
+            "volume":          volume,
+            "order_type":      order_type_str,
+            "price":           submit_price if order_type_str == "limit" else 0,
+            "cl_ord_id":       cl_ord_id,
+        })
 
 
 # ── matched ───────────────────────────────────────────────────────────
@@ -299,12 +302,14 @@ def _cancel_alive(batch_id: str, unfinished: dict[str, list]) -> None:
         except Exception:
             log.exception("order_cancel failed for batch %s", batch_id)
 
-    for o in ours:
-        order_log.append(batch_id, {
-            "ts_ms":     unix_now_ms(),
-            "event":     "cancel",
-            "cl_ord_id": o.cl_ord_id,
-        })
+    # One fd, one open + one close, regardless of how many cancel lines.
+    with order_log.cycle_session(batch_id) as session:
+        for o in ours:
+            session.append({
+                "ts_ms":     unix_now_ms(),
+                "event":     "cancel",
+                "cl_ord_id": o.cl_ord_id,
+            })
 
 
 # ── shared bits ───────────────────────────────────────────────────────

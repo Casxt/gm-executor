@@ -1,35 +1,51 @@
 """Per-batch JSONL log: append, replay, locate, move, plus the cl_ord_id index.
 
-Concurrency rules from FLOW.md:
+Two write paths:
 
-* Writers (`append`) hold `batch_state_lock` for the whole locate→open→write→close,
-  then briefly `log_lock` for write-exclusion. Lock order is `batch_state_lock` then
-  `log_lock`; never the reverse.
-* Readers (`replay_record`) acquire both locks too, briefly, so they always observe a
-  consistent file (no path-changes mid-read, no half-written line).
-* `clord_index` is written only by the cycle worker (under `batch_state_lock`) and read only by
-  the `callback-processor` daemon (also under `batch_state_lock`). Events delivered during a cycle
-  sit in the SDK→drain queue until the cycle releases the lock, so the drain always observes a
-  fully-committed `clord_index`. No race, no dropped events for our own orders.
-* No `os.fsync` and no explicit `flush`: broker is source of truth, log is audit.
-  `close()` flushes Python's buffer to the OS, so a crash never loses an already-
-  written line; we just skip the redundant kernel hop. Power-cut may lose a few.
+* `cycle_session(batch_id)` — cycle worker. Opens the active batch's record fd
+  *once* per cycle and reuses it for every append in that cycle. Active batches
+  always live in `pending/`, so the path is hardcoded (no locate). This is the
+  hot path: a 5-order cycle appends 5+ lines through one fd.
+
+* `append(batch_id, event)` — callback-processor drain. Sparse, opens/writes/
+  closes per event. Uses `locate_record` because the batch may have moved to
+  `finished/` or `expired/` between submit and a late callback.
+
+Why two paths — observed 2026-05-03 on cloud VM with metadata-IOPS throttling:
+every kernel metadata op (open, close, `path.exists`) gets quantized to ~1010ms
+refill buckets. With per-append open+close, a 5-order cycle paid ~8s of bucket
+waits inside `append`. The session amortises this to one open + one close per
+cycle, regardless of N. Callback path stays simple — its appends are sparse
+and time-spread, so the bucket cost is rarely felt.
+
+Concurrency:
+
+* The cycle worker holds `batch_state_lock` for the entire `run_cycle`, so it
+  is the *only* writer for that duration. The session writes without
+  `log_lock` — no contention is possible.
+* Callbacks acquire `batch_state_lock` then briefly `log_lock` for
+  open→write→close. Because batch_state_lock is held, log_lock is currently
+  redundant; kept as a defensive write-exclusion gate for any future code.
+* `clord_index` is written only by the cycle worker (under `batch_state_lock`)
+  and read only by the drain (also under `batch_state_lock`). Events delivered
+  mid-cycle sit in the SDK→drain queue until the cycle releases.
 * `batch_state_lock` is reentrant: the cycle worker holds it across the entire
-  `run_cycle`, then re-enters here via `append` / `replay_record` / `move_pair`.
+  `run_cycle`, then re-enters here via `cycle_session` / `replay_record` /
+  `move_pair`.
+* No `os.fsync` and no explicit `flush`: broker is source of truth, log is
+  audit. `close()` flushes Python's buffer to the OS, so a crash never loses
+  an already-written line. Power-cut may lose a few.
 """
 
 import json
 import logging
 import shutil
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from . import config, state
-
-_APPEND_SLOW_MS = 50.0
-"""Per-step breakdown emitted when total append exceeds this. Bench shows ~0.4ms;
-real cycle shows 1–8s. The threshold filters noise; 50ms is well above any bench."""
 
 log = logging.getLogger(__name__)
 
@@ -52,7 +68,10 @@ def _batch_path(batch_dir: Path, batch_id: str) -> Path:
 def locate_record(batch_id: str) -> Path | None:
     """First matching record file across pending/finished/expired/.
 
-    Caller MUST hold `batch_state_lock`.
+    Caller MUST hold `batch_state_lock`. Each `path.exists()` is a kernel
+    metadata op — on a throttled cloud disk it can take ~1010ms. The cycle
+    avoids this entirely via `cycle_session`; only the (sparse) callback
+    path uses it.
     """
     for d in config.LIVE_DIRS:
         p = _record_path(d, batch_id)
@@ -61,22 +80,78 @@ def locate_record(batch_id: str) -> Path | None:
     return None
 
 
-# ── append ────────────────────────────────────────────────────────────
+# ── cycle session: one open fd reused across all appends in one cycle ─
+
+class _Session:
+    """Lazy-open fd for the cycle's appends to a single batch.
+
+    The fd opens on the *first* append (so a no-op cycle pays zero file-IO).
+    Subsequent appends are pure userspace writes. `close()` happens at the
+    `with` block's exit and is the only other metadata op.
+    """
+
+    def __init__(self, batch_id: str, path: Path):
+        self._batch_id = batch_id
+        self._path = path
+        self._fd = None
+        self._writes = 0
+        self._open_ms = 0.0
+
+    def append(self, event: dict[str, Any]) -> None:
+        line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+        if self._fd is None:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            t0 = time.perf_counter()
+            self._fd = open(self._path, "a", encoding="utf-8")
+            self._open_ms = (time.perf_counter() - t0) * 1000
+        self._fd.write(line)
+        self._writes += 1
+
+    def _close(self) -> None:
+        if self._fd is None:
+            return
+        t0 = time.perf_counter()
+        self._fd.close()
+        close_ms = (time.perf_counter() - t0) * 1000
+        log.info("session: batch=%s writes=%d open=%.1fms close=%.1fms",
+                 self._batch_id, self._writes, self._open_ms, close_ms)
+
+
+@contextmanager
+def cycle_session(batch_id: str) -> Iterator[_Session]:
+    """One open fd reused across all appends in one cycle. Active batches
+    always live in `pending/`, so the path is hardcoded (no locate).
+
+    Caller MUST hold `batch_state_lock` (typically the cycle worker, which
+    holds it for the whole `run_cycle`). Lazy-open: a session that gets no
+    appends does no file-IO at all.
+    """
+    s = _Session(batch_id, _record_path(config.PENDING_DIR, batch_id))
+    try:
+        yield s
+    finally:
+        s._close()
+
+
+# ── append (callback path) ────────────────────────────────────────────
+
+_APPEND_SLOW_MS = 50.0
+"""Per-step breakdown emitted when total append exceeds this. Bench shows ~0.4ms;
+throttled cloud disk shows 1–8s. The threshold filters noise."""
+
 
 def append(batch_id: str, event: dict[str, Any]) -> None:
-    """Append one JSONL line to a batch's record.
+    """Append one JSONL line to a batch's record. Callback-drain path only.
 
-    The first line is always a `submit` written by the cycle thread; that call also
-    creates the record file. For non-`submit` events arriving before any submit
-    landed (callbacks for foreign orders, or a clord_index miss), we drop and warn.
+    The cycle uses `cycle_session` for batched appends; callbacks use this
+    because a late callback may need to write to a record now in `finished/`
+    or `expired/`, so we still need to `locate_record`.
     """
     line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     t0 = time.perf_counter()
     with state.batch_state_lock:
-        t_bsl = time.perf_counter()
         path = locate_record(batch_id)
-        t_locate = time.perf_counter()
         if path is None:
             if event.get("event") != "submit":
                 log.warning("no record for batch_id=%s; dropping event=%s",
@@ -87,27 +162,19 @@ def append(batch_id: str, event: dict[str, Any]) -> None:
         t_setup = time.perf_counter()
 
         with state.log_lock:
-            t_loglock = time.perf_counter()
             with open(path, "a", encoding="utf-8") as f:
                 t_open = time.perf_counter()
                 f.write(line)
-                t_write = time.perf_counter()
             t_close = time.perf_counter()
     t_done = time.perf_counter()
 
     total_ms = (t_done - t0) * 1000
     if total_ms > _APPEND_SLOW_MS:
-        log.info("append slow: total=%.1fms batch=%s | bsl=%.1f locate=%.1f setup=%.1f "
-                 "loglock=%.1f open=%.1f write=%.1f close=%.1f release=%.1f",
+        log.info("append slow: total=%.1fms batch=%s | setup=%.1f open=%.1f close=%.1f",
                  total_ms, batch_id,
-                 (t_bsl     - t0)        * 1000,
-                 (t_locate  - t_bsl)     * 1000,
-                 (t_setup   - t_locate)  * 1000,
-                 (t_loglock - t_setup)   * 1000,
-                 (t_open    - t_loglock) * 1000,
-                 (t_write   - t_open)    * 1000,
-                 (t_close   - t_write)   * 1000,
-                 (t_done    - t_close)   * 1000)
+                 (t_setup - t0)      * 1000,
+                 (t_open  - t_setup) * 1000,
+                 (t_close - t_open)  * 1000)
 
 
 # ── replay ────────────────────────────────────────────────────────────

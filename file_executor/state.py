@@ -29,7 +29,9 @@ CYCLE_GRACE_SECONDS so other threads get uncontended time. 0.0 ⇒ no cycle yet.
 
 # ── locks ─────────────────────────────────────────────────────────────
 log_lock:      threading.Lock = threading.Lock()
-"""Serialises *writes* to any order_record.jsonl. Brief — open→write→fsync→close."""
+"""Held briefly by the callback-drain `append` for open→write→close. With
+`batch_state_lock` already serialising all record-file writers, log_lock is
+redundant in current code; kept as a defensive write-exclusion gate."""
 
 batch_state_lock: threading.RLock = threading.RLock()
 """Serialises everything that observes or mutates **which directory each batch lives in**.

@@ -97,9 +97,17 @@ The split decouples SDK dispatch from our locks. Events delivered while a cycle 
 
 ## Locks
 
-* `log_lock` — serialises **writes** to any `order_record.jsonl`. Brief: open → write → close (no flush, no fsync).
 * `batch_state_lock` — serialises **everything that observes or changes which directory a batch lives in**: cross-dir moves, path lookups, the connector's `is_terminal`+`atomic_copy`, the entire `run_cycle`, and every drained callback event. Reentrant — the cycle re-acquires it via `order_log` helpers.
+* `log_lock` — held briefly by the callback-drain `append` for open → write → close. With `batch_state_lock` already serialising all record-file writers, log_lock is currently redundant; kept as a defensive write-exclusion gate.
 * Lock order: `batch_state_lock` then `log_lock`. Never reverse.
+
+## Per-cycle log writes
+
+`order_log.cycle_session(batch_id)` opens one fd at the start of a cycle and reuses it for every append in that cycle. `_reconcile` and `_cancel_alive` both wrap their per-order loops in `with cycle_session(...) as s: s.append(...)`. Active batches always live in `pending/`, so the path is hardcoded — no `locate_record`, no `path.exists` syscalls.
+
+Why: on the cloud VM (2026-05-03 measurement), every kernel metadata op (open, close, `path.exists`) is quantized to ~1010ms refill buckets. With per-append open+close, a 5-order cycle paid ~8s of bucket waits inside `append` alone. With `cycle_session`, that's one open + one close per cycle — 2 bucket waits regardless of N. Subsequent appends are pure userspace writes.
+
+The callback-drain path keeps the original `order_log.append` because (a) it's sparse — typically a few events per drain burst, time-spread enough that bucket cost is rarely felt, and (b) a late callback may need to write to a record that has since moved to `finished/` or `expired/`, so it still needs `locate_record`.
 
 ## Routing — `cl_ord_id → batch_id`
 
