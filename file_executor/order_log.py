@@ -20,10 +20,15 @@ Concurrency rules from FLOW.md:
 import json
 import logging
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
 from . import config, state
+
+_APPEND_SLOW_MS = 50.0
+"""Per-step breakdown emitted when total append exceeds this. Bench shows ~0.4ms;
+real cycle shows 1–8s. The threshold filters noise; 50ms is well above any bench."""
 
 log = logging.getLogger(__name__)
 
@@ -66,8 +71,11 @@ def append(batch_id: str, event: dict[str, Any]) -> None:
     """
     line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
 
+    t0 = time.perf_counter()
     with state.batch_state_lock:
+        t_bsl = time.perf_counter()
         path = locate_record(batch_id)
+        t_locate = time.perf_counter()
         if path is None:
             if event.get("event") != "submit":
                 log.warning("no record for batch_id=%s; dropping event=%s",
@@ -75,11 +83,33 @@ def append(batch_id: str, event: dict[str, Any]) -> None:
                 return
             path = _record_path(config.PENDING_DIR, batch_id)
             path.parent.mkdir(parents=True, exist_ok=True)
+        t_setup = time.perf_counter()
 
         with state.log_lock:
+            t_loglock = time.perf_counter()
             with open(path, "a", encoding="utf-8") as f:
+                t_open = time.perf_counter()
                 f.write(line)
+                t_write = time.perf_counter()
                 f.flush()                                        # no fsync — see ORDER_RECORD.md
+                t_flush = time.perf_counter()
+            t_close = time.perf_counter()
+    t_done = time.perf_counter()
+
+    total_ms = (t_done - t0) * 1000
+    if total_ms > _APPEND_SLOW_MS:
+        log.info("append slow: total=%.1fms batch=%s | bsl=%.1f locate=%.1f setup=%.1f "
+                 "loglock=%.1f open=%.1f write=%.1f flush=%.1f close=%.1f release=%.1f",
+                 total_ms, batch_id,
+                 (t_bsl     - t0)        * 1000,
+                 (t_locate  - t_bsl)     * 1000,
+                 (t_setup   - t_locate)  * 1000,
+                 (t_loglock - t_setup)   * 1000,
+                 (t_open    - t_loglock) * 1000,
+                 (t_write   - t_open)    * 1000,
+                 (t_flush   - t_write)   * 1000,
+                 (t_close   - t_flush)   * 1000,
+                 (t_done    - t_close)   * 1000)
 
 
 # ── replay ────────────────────────────────────────────────────────────
