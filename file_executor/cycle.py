@@ -80,7 +80,9 @@ def run_cycle() -> None:
     # Held for the whole cycle so connector mirrors and callback-driven path
     # lookups can't interleave with reconcile. Reentrant — order_log helpers
     # re-acquire freely.
-    with state.batch_state_lock:
+    with timed("acquire_lock"):
+        state.batch_state_lock.acquire()
+    try:
         now = unix_now()
         positions, unfinished = _broker_snapshot()
 
@@ -103,6 +105,8 @@ def run_cycle() -> None:
         if done:
             log.info("matched: %s -> finished/", doc.batch_id)
             order_log.move_pair(doc.batch_id, config.FINISHED_DIR)
+    finally:
+        state.batch_state_lock.release()
 
 
 # ── pass 1: clean pending/ ────────────────────────────────────────────
@@ -110,7 +114,10 @@ def run_cycle() -> None:
 def _pass_one(now: int, unfinished: dict[str, list]) -> tuple[list[BatchDoc], list[BatchDoc]]:
     seen:   list[BatchDoc] = []
     active: list[BatchDoc] = []
-    for path in sorted(config.PENDING_DIR.glob("*.json")):
+    with timed("pass_one_glob") as f:
+        paths = sorted(config.PENDING_DIR.glob("*.json"))
+        f["n"] = len(paths)
+    for path in paths:
         try:
             doc = parse_and_validate(path)
         except Exception:
