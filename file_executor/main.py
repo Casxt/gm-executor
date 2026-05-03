@@ -52,6 +52,7 @@ def init(context) -> None:
              config.ORDERS_DIR, config.POLL_SECONDS)
 
     config.ensure_dirs()
+    config.bench_disk()
     order_log.rebuild_clord_index()
 
     # Drain callbacks AFTER clord_index is rebuilt: any queued events from before

@@ -4,7 +4,9 @@ Every value here comes from an env var. No file I/O at import time except
 `ensure_dirs()`, which is called explicitly during `init()`.
 """
 
+import logging
 import os
+import time
 from pathlib import Path
 
 # ── orders directory ──────────────────────────────────────────────────
@@ -51,3 +53,41 @@ REMOTE_LOG_QUEUE_MAX: int  = int(os.environ.get("GMX_REMOTE_LOG_QUEUE_MAX", "100
 def ensure_dirs() -> None:
     for d in ALL_BATCH_DIRS:
         d.mkdir(parents=True, exist_ok=True)
+
+
+def bench_disk() -> None:
+    """One-shot disk smoke test on PENDING_DIR. Logged at INFO so AV/path issues
+    show up at startup instead of surprising us mid-cycle.
+
+    Each measurement is the median of N tries — single samples on Windows + AV
+    are too noisy (first hit often 100x the steady-state cost).
+    """
+    log = logging.getLogger("file_executor.bench")
+    probe = PENDING_DIR / ".bench_probe"
+    payload = ("x" * 200 + "\n") * 5                    # ~1 KB, 5 lines
+
+    def _med(fn, n: int = 5) -> float:
+        samples = []
+        for _ in range(n):
+            t0 = time.perf_counter()
+            fn()
+            samples.append((time.perf_counter() - t0) * 1000)
+        samples.sort()
+        return samples[len(samples) // 2]
+
+    try:
+        glob_ms = _med(lambda: list(PENDING_DIR.glob("*.json")))
+        def _write():
+            with open(probe, "w", encoding="utf-8") as f: f.write(payload); f.flush()
+        write_ms = _med(_write)
+        def _read():
+            with open(probe, "r", encoding="utf-8") as f: f.read()
+        read_ms = _med(_read)
+        log.info("disk_bench: pending/ glob=%.1fms write=%.1fms read=%.1fms (median of 5; "
+                 "expect <5ms each — sustained >100ms ⇒ AV/cloud-sync hooking the path)",
+                 glob_ms, write_ms, read_ms)
+    except Exception:
+        log.exception("disk_bench failed")
+    finally:
+        try: probe.unlink(missing_ok=True)
+        except Exception: pass
