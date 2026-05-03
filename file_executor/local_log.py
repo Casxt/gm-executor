@@ -32,14 +32,19 @@ def start() -> None:
     console.setFormatter(formatter)
 
     config.LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = config.LOG_DIR / config.LOG_FILE
     file_handler = RotatingFileHandler(
-        config.LOG_DIR / config.LOG_FILE,
+        log_path,
         maxBytes=config.LOG_MAX_BYTES,
         backupCount=config.LOG_BACKUP_COUNT,
         encoding="utf-8",
     )
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
+    # Rotate on startup so each run gets its own file. Old runs survive as .1/.2/...
+    # up to backupCount; nothing is overwritten silently.
+    if log_path.exists() and log_path.stat().st_size > 0:
+        file_handler.doRollover()
 
     q: SimpleQueue = SimpleQueue()
     queue_handler = QueueHandler(q)
