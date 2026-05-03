@@ -20,7 +20,7 @@ import sys
 from gm.api import MODE_LIVE, run, set_token, stop, timer
 
 from file_executor import callbacks as _cb
-from file_executor import config, connector, order_log, remote_log, state, worker
+from file_executor import bench, config, connector, order_log, remote_log, state, worker
 
 # ── SDK callback bindings (module-level so the SDK's importer sees them) ─
 on_timer                    = _cb.on_timer
@@ -52,7 +52,7 @@ def init(context) -> None:
              config.ORDERS_DIR, config.POLL_SECONDS)
 
     config.ensure_dirs()
-    config.bench_disk()
+    bench.bench_disk()
     order_log.rebuild_clord_index()
 
     # Drain callbacks AFTER clord_index is rebuilt: any queued events from before
