@@ -16,6 +16,7 @@ until the cycle releases.
 import logging
 import queue
 import threading
+import time
 
 from gm.api import (
     ExecType_CancelRejected,
@@ -235,6 +236,7 @@ def on_trade_data_connected(context) -> None:
     try:
         log.info("trade channel up")
         state.trade_channel_up.set()
+        state.trade_channel_up_at = time.time()                  # arms reconnect grace
     except Exception:
         log.exception("on_trade_data_connected failed")
 

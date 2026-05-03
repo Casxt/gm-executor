@@ -126,8 +126,26 @@ When the trade channel drops, the SDK auto-reconnects, but during the gap `get_p
 def run_cycle():
     if not trade_channel_up.is_set():
         log.warning("skipping cycle: trade channel down"); return
+    if state.trade_channel_up_at > 0 \
+       and time.time() - state.trade_channel_up_at < RECONNECT_GRACE_SECONDS:
+        log.info("skipping cycle: reconnect grace ..."); return    # see "Reconnect replay"
     ...
 ```
+
+`trade_channel_up_at` is stamped on every `on_trade_data_connected` callback — both the first connect and every reconnect. While `now - trade_channel_up_at < RECONNECT_GRACE_SECONDS`, the cycle skips. This costs one cycle at cold start (acceptable) and gives the broker time to finish replaying the status burst after a reconnect (essential).
+
+## Reconnect replay
+
+GM server restarts daily around ~08:50 China time, dropping the trade channel for a few seconds. **On reconnect, the broker replays recent order statuses and execution reports** — `on_order_status` and `on_execution_report` fire for every order from the past ~24h, in one burst.
+
+The drain handles this naturally: events queue, process under `batch_state_lock`, append to whichever batch each `cl_ord_id` belongs to (via `clord_index`). No special handling needed.
+
+Operational notes:
+
+* Burst depth observed: ~50–100 events for a normal day; drain pending climbs to many minutes before catching up
+* `clord_index` is rebuilt from live `.order_record.jsonl` files at startup, so replays for batches still under `pending/finished/expired/` route correctly
+* If a `cl_ord_id` is replayed for a batch whose record was lost (crash between `order_volume` return and submit append), it surfaces as `status for foreign cl_ord_id ...; dropping`. Harmless — broker is still source of truth on the next cycle's `get_unfinished_orders()`.
+* Filled orders are replayed too: a `status=Filled` line, then `exec_type=Trade` execrpt(s). Both append to the historical batch's log; reconciliation has long since moved that batch to `finished/`.
 
 ## Lifecycle
 
@@ -161,3 +179,4 @@ In-flight orders are **never** cancelled at shutdown. The broker keeps them; on 
 | `GM_ACCOUNT_ID`    | no       | —          | default when a batch omits `account_id`              |
 | `GMX_ORDERS_DIR`   | no       | `./orders` | orders root for `pending/`, `finished/`, `expired/`, `failed/` |
 | `GMX_POLL_SECONDS` | no       | `30`       | timer interval                                       |
+| `GMX_RECONNECT_GRACE_SECONDS` | no | `30` | cycle skip window after each `on_trade_data_connected` |

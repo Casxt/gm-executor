@@ -19,6 +19,12 @@ trade_channel_up: threading.Event = threading.Event()
 """Optimistic at startup; first heartbeat callback confirms or clears."""
 trade_channel_up.set()
 
+trade_channel_up_at: float = 0.0
+"""`time.time()` of the most recent `on_trade_data_connected` callback. The cycle
+skips while `now - trade_channel_up_at < RECONNECT_GRACE_SECONDS` to let the
+reconnect replay storm settle (FLOW.md "Reconnect replay"). 0.0 ⇒ no callback yet,
+optimistic flag governs."""
+
 # ── locks ─────────────────────────────────────────────────────────────
 log_lock:      threading.Lock = threading.Lock()
 """Serialises *writes* to any order_record.jsonl. Brief — open→write→fsync→close."""

@@ -66,6 +66,17 @@ def run_cycle() -> None:
         log.warning("skipping cycle: trade channel down")
         return
 
+    # Reconnect grace: skip for RECONNECT_GRACE_SECONDS after every
+    # `on_trade_data_connected` so the broker's status-replay storm settles
+    # before we trust the position/unfinished snapshot. trade_channel_up_at == 0.0
+    # ⇒ no callback yet (cold-start optimistic flag); skip the gate.
+    if state.trade_channel_up_at > 0:
+        elapsed = time.time() - state.trade_channel_up_at
+        if elapsed < config.RECONNECT_GRACE_SECONDS:
+            log.info("skipping cycle: reconnect grace (%.1fs of %ds)",
+                     elapsed, config.RECONNECT_GRACE_SECONDS)
+            return
+
     # Held for the whole cycle so connector mirrors and callback-driven path
     # lookups can't interleave with reconcile. Reentrant — order_log helpers
     # re-acquire freely.
