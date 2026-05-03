@@ -29,9 +29,9 @@ CYCLE_GRACE_SECONDS so other threads get uncontended time. 0.0 ⇒ no cycle yet.
 
 # ── locks ─────────────────────────────────────────────────────────────
 log_lock:      threading.Lock = threading.Lock()
-"""Held briefly by the callback-drain `append` for open→write→close. With
-`batch_state_lock` already serialising all record-file writers, log_lock is
-redundant in current code; kept as a defensive write-exclusion gate."""
+"""Currently unused — kept as a defensive write-exclusion gate for any future
+code path that touches a record file outside `batch_state_lock`. With sessions
+in `order_log`, all writers are already serialised by `batch_state_lock`."""
 
 batch_state_lock: threading.RLock = threading.RLock()
 """Serialises everything that observes or mutates **which directory each batch lives in**.

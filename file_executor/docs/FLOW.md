@@ -83,31 +83,42 @@ def on_order_status(context, order):
 
 def _drain_loop():                                       # callback-processor thread
     while True:
-        evt = _event_queue.get()
+        evt = _event_queue.get()                         # block for at least one event
         if evt is None: return                           # sentinel from stop()
-        try:
-            with batch_state_lock:                       # serialise behind any in-flight cycle
-                batch_id = clord_index.get(evt["cl_ord_id"])
-                if batch_id is None: warn_foreign(evt); continue
-                order_log.append(batch_id, build_event(evt))
-        except Exception: log.exception("processor failed: %r", evt)
+        events = [evt]
+        while True:                                      # drain everything else queued
+            try: events.append(_event_queue.get_nowait())
+            except queue.Empty: break
+        with batch_state_lock:                           # one lock acquisition per pass
+            by_batch = group_by_batch_id(events)         # foreign cl_ord_ids dropped + warned
+            for batch_id, lines in by_batch.items():
+                with order_log.drain_session(batch_id) as s:
+                    for ln in lines: s.append(ln)        # one open + N writes + one close
 ```
 
 The split decouples SDK dispatch from our locks. Events delivered while a cycle holds `batch_state_lock` sit safely in the queue; the drain processes them after the cycle releases. No event for our own orders is ever lost; "foreign" warnings now genuinely mean "not ours".
 
 ## Locks
 
-* `batch_state_lock` — serialises **everything that observes or changes which directory a batch lives in**: cross-dir moves, path lookups, the connector's `is_terminal`+`atomic_copy`, the entire `run_cycle`, and every drained callback event. Reentrant — the cycle re-acquires it via `order_log` helpers.
-* `log_lock` — held briefly by the callback-drain `append` for open → write → close. With `batch_state_lock` already serialising all record-file writers, log_lock is currently redundant; kept as a defensive write-exclusion gate.
+* `batch_state_lock` — serialises **everything that observes or changes which directory a batch lives in**: cross-dir moves, path lookups, the connector's `is_terminal`+`atomic_copy`, the entire `run_cycle`, and every drained callback pass. Reentrant — the cycle re-acquires it via `order_log` helpers.
+* `log_lock` — currently unused. Kept around as a defensive write-exclusion gate for any future code path that touches a record file outside `batch_state_lock`.
 * Lock order: `batch_state_lock` then `log_lock`. Never reverse.
 
-## Per-cycle log writes
+## Session-based log writes
 
-`order_log.cycle_session(batch_id)` opens one fd at the start of a cycle and reuses it for every append in that cycle. `_reconcile` and `_cancel_alive` both wrap their per-order loops in `with cycle_session(...) as s: s.append(...)`. Active batches always live in `pending/`, so the path is hardcoded — no `locate_record`, no `path.exists` syscalls.
+Every record-file write goes through one of two session helpers in `order_log`. Both follow the same pattern — one open + N buffered writes + one close — differing only in how they pick the path:
 
-Why: on the cloud VM (2026-05-03 measurement), every kernel metadata op (open, close, `path.exists`) is quantized to ~1010ms refill buckets. With per-append open+close, a 5-order cycle paid ~8s of bucket waits inside `append` alone. With `cycle_session`, that's one open + one close per cycle — 2 bucket waits regardless of N. Subsequent appends are pure userspace writes.
+* **`cycle_session(batch_id)`** — used by `_reconcile` and `_cancel_alive` in `cycle.py`. Active batches always live in `pending/`, so the path is hardcoded (no `locate_record`).
+* **`drain_session(batch_id)`** — used by the callback-drain pass. Locates the record once (might be in `pending/` / `finished/` / `expired/`); yields `None` if the record is gone so the caller can warn-and-drop.
 
-The callback-drain path keeps the original `order_log.append` because (a) it's sparse — typically a few events per drain burst, time-spread enough that bucket cost is rarely felt, and (b) a late callback may need to write to a record that has since moved to `finished/` or `expired/`, so it still needs `locate_record`.
+Why session-based — observed 2026-05-03 on cloud VM with metadata-IOPS throttling: every kernel metadata op (open, close, `path.exists`) is quantized to ~1010ms refill buckets. Per-event open+close paid ~2 bucket waits each.
+
+| path                   | before                           | after (sessions)                |
+| ---------------------- | -------------------------------- | ------------------------------- |
+| 5-order reconcile      | ~8s wall (5 × 2 bucket waits)    | ~120ms wall (1 × 2 bucket waits)|
+| Drain pass for 1 batch | N × 2 bucket waits per N events  | 2 bucket waits regardless of N  |
+
+The drain coalesces: it pulls one event blocking, then non-blocking-drains everything else queued, groups by `batch_id`, and runs one `drain_session` per batch. Critical for the daily reconnect replay (~50–100 events), which used to spend minutes catching up.
 
 ## Routing — `cl_ord_id → batch_id`
 

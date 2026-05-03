@@ -127,4 +127,9 @@ The cycle then cross-checks every "live" `cl_ord_id` against `get_unfinished_ord
 
 ## File-IO shape
 
-The cycle worker uses `order_log.cycle_session(batch_id)` — one open fd held across all appends in one cycle, closed at cycle end. The callback-drain path uses `order_log.append(batch_id, event)` — open/write/close per event. See [FLOW.md § Per-cycle log writes](./FLOW.md) for the rationale (cloud-disk metadata-IOPS throttling, 2026-05-03 measurement).
+Every append goes through a session: one `open` + N buffered `write`s + one `close` per (pass, batch).
+
+* Cycle worker uses `order_log.cycle_session(batch_id)`; path is hardcoded to `pending/`.
+* Callback-drain pass uses `order_log.drain_session(batch_id)`; path is located across `pending/finished/expired/`.
+
+See [FLOW.md § Session-based log writes](./FLOW.md) for the rationale (cloud-disk metadata-IOPS throttling, 2026-05-03 measurement: 5-order reconcile dropped from ~8s to ~120ms).

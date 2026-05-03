@@ -1,31 +1,30 @@
-"""Per-batch JSONL log: append, replay, locate, move, plus the cl_ord_id index.
+"""Per-batch JSONL log: session-based append, replay, locate, move, plus the cl_ord_id index.
 
-Two write paths:
+Two session helpers — both follow the same one-open + N-writes + one-close
+pattern, differing only in how they obtain the path:
 
-* `cycle_session(batch_id)` — cycle worker. Opens the active batch's record fd
-  *once* per cycle and reuses it for every append in that cycle. Active batches
-  always live in `pending/`, so the path is hardcoded (no locate). This is the
-  hot path: a 5-order cycle appends 5+ lines through one fd.
+* `cycle_session(batch_id)` — cycle worker. Active batches always live in
+  `pending/`, so the path is hardcoded (no locate). 5-order reconcile = 5
+  buffered writes through one fd.
 
-* `append(batch_id, event)` — callback-processor drain. Sparse, opens/writes/
-  closes per event. Uses `locate_record` because the batch may have moved to
-  `finished/` or `expired/` between submit and a late callback.
+* `drain_session(batch_id)` — callback-processor drain pass. Locates the
+  record once (might be in pending/finished/expired); yields `None` if the
+  record is gone so the caller can drop + warn. The drain coalesces the
+  events it pulled from the queue by batch_id and runs one session per batch.
 
-Why two paths — observed 2026-05-03 on cloud VM with metadata-IOPS throttling:
-every kernel metadata op (open, close, `path.exists`) gets quantized to ~1010ms
-refill buckets. With per-append open+close, a 5-order cycle paid ~8s of bucket
-waits inside `append`. The session amortises this to one open + one close per
-cycle, regardless of N. Callback path stays simple — its appends are sparse
-and time-spread, so the bucket cost is rarely felt.
+Why session-based — observed 2026-05-03 on cloud VM with metadata-IOPS
+throttling: every kernel metadata op (open, close, `path.exists`) is
+quantized to ~1010ms refill buckets. Per-append open+close paid ~2 bucket
+waits each. With sessions: one open + one close per (pass, batch), regardless
+of how many lines are written. Reconcile dropped from ~8s wall to ~120ms.
 
 Concurrency:
 
-* The cycle worker holds `batch_state_lock` for the entire `run_cycle`, so it
-  is the *only* writer for that duration. The session writes without
-  `log_lock` — no contention is possible.
-* Callbacks acquire `batch_state_lock` then briefly `log_lock` for
-  open→write→close. Because batch_state_lock is held, log_lock is currently
-  redundant; kept as a defensive write-exclusion gate for any future code.
+* The cycle worker holds `batch_state_lock` for the entire `run_cycle`; the
+  drain takes it for one drain pass. Both are sole writers for their window,
+  so sessions write without `log_lock`.
+* `log_lock` is currently unused (kept around for any future code path that
+  touches a record file outside `batch_state_lock`).
 * `clord_index` is written only by the cycle worker (under `batch_state_lock`)
   and read only by the drain (also under `batch_state_lock`). Events delivered
   mid-cycle sit in the SDK→drain queue until the cycle releases.
@@ -83,16 +82,17 @@ def locate_record(batch_id: str) -> Path | None:
 # ── cycle session: one open fd reused across all appends in one cycle ─
 
 class _Session:
-    """Lazy-open fd for the cycle's appends to a single batch.
+    """Lazy-open fd for one batch's appends within a single pass (cycle or drain).
 
-    The fd opens on the *first* append (so a no-op cycle pays zero file-IO).
+    The fd opens on the *first* append (so a no-op session pays zero file-IO).
     Subsequent appends are pure userspace writes. `close()` happens at the
     `with` block's exit and is the only other metadata op.
     """
 
-    def __init__(self, batch_id: str, path: Path):
+    def __init__(self, batch_id: str, path: Path, kind: str):
         self._batch_id = batch_id
         self._path = path
+        self._kind = kind
         self._fd = None
         self._writes = 0
         self._open_ms = 0.0
@@ -113,8 +113,8 @@ class _Session:
         t0 = time.perf_counter()
         self._fd.close()
         close_ms = (time.perf_counter() - t0) * 1000
-        log.info("session: batch=%s writes=%d open=%.1fms close=%.1fms",
-                 self._batch_id, self._writes, self._open_ms, close_ms)
+        log.info("%s session: batch=%s writes=%d open=%.1fms close=%.1fms",
+                 self._kind, self._batch_id, self._writes, self._open_ms, close_ms)
 
 
 @contextmanager
@@ -126,55 +126,35 @@ def cycle_session(batch_id: str) -> Iterator[_Session]:
     holds it for the whole `run_cycle`). Lazy-open: a session that gets no
     appends does no file-IO at all.
     """
-    s = _Session(batch_id, _record_path(config.PENDING_DIR, batch_id))
+    s = _Session(batch_id, _record_path(config.PENDING_DIR, batch_id), kind="cycle")
     try:
         yield s
     finally:
         s._close()
 
 
-# ── append (callback path) ────────────────────────────────────────────
+@contextmanager
+def drain_session(batch_id: str) -> "Iterator[_Session | None]":
+    """One open fd reused across all callback-drain appends to one batch in one
+    drain pass. Locates the record once (might be in pending/finished/expired);
+    yields `None` if the record is gone — caller drops + warns.
 
-_APPEND_SLOW_MS = 50.0
-"""Per-step breakdown emitted when total append exceeds this. Bench shows ~0.4ms;
-throttled cloud disk shows 1–8s. The threshold filters noise."""
+    Caller MUST hold `batch_state_lock`. Lazy-open like `cycle_session`.
 
-
-def append(batch_id: str, event: dict[str, Any]) -> None:
-    """Append one JSONL line to a batch's record. Callback-drain path only.
-
-    The cycle uses `cycle_session` for batched appends; callbacks use this
-    because a late callback may need to write to a record now in `finished/`
-    or `expired/`, so we still need to `locate_record`.
+    Why: during the daily reconnect replay (~50–100 events burst), per-event
+    open+close paid ~2 bucket waits each = minutes of drain backlog. Coalescing
+    a drain pass's events by batch_id collapses that to one open + one close
+    per batch.
     """
-    line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
-
-    t0 = time.perf_counter()
-    with state.batch_state_lock:
-        path = locate_record(batch_id)
-        if path is None:
-            if event.get("event") != "submit":
-                log.warning("no record for batch_id=%s; dropping event=%s",
-                            batch_id, event.get("event"))
-                return
-            path = _record_path(config.PENDING_DIR, batch_id)
-            path.parent.mkdir(parents=True, exist_ok=True)
-        t_setup = time.perf_counter()
-
-        with state.log_lock:
-            with open(path, "a", encoding="utf-8") as f:
-                t_open = time.perf_counter()
-                f.write(line)
-            t_close = time.perf_counter()
-    t_done = time.perf_counter()
-
-    total_ms = (t_done - t0) * 1000
-    if total_ms > _APPEND_SLOW_MS:
-        log.info("append slow: total=%.1fms batch=%s | setup=%.1f open=%.1f close=%.1f",
-                 total_ms, batch_id,
-                 (t_setup - t0)      * 1000,
-                 (t_open  - t_setup) * 1000,
-                 (t_close - t_open)  * 1000)
+    path = locate_record(batch_id)
+    if path is None:
+        yield None
+        return
+    s = _Session(batch_id, path, kind="drain")
+    try:
+        yield s
+    finally:
+        s._close()
 
 
 # ── replay ────────────────────────────────────────────────────────────

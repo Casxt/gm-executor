@@ -125,29 +125,92 @@ def on_execution_report(context, execrpt) -> None:
 
 
 # ── drain worker ──────────────────────────────────────────────────────
+#
+# Each loop iteration: block on the queue for one event, then non-blocking-drain
+# everything else queued, then process that whole batch in one pass under one
+# `batch_state_lock` acquisition. Events are grouped by batch_id and written
+# through one `drain_session` per batch — one open + one close per batch
+# regardless of how many lines.
+#
+# Why coalesce: on the throttled cloud disk, every kernel metadata op pays a
+# ~1010ms refill-bucket wait (2026-05-03 measurement). Per-event open+close
+# cost ~2 buckets each; the daily reconnect replay (~50–100 events) used to
+# spend minutes draining. Coalescing collapses N events for one batch into 2
+# bucket waits. Typical drain pass has 1 batch.
+
 
 def _drain_loop() -> None:
-    while True:
+    stop = False
+    while not stop:
         try:
-            evt = _event_queue.get()                            # blocks
+            evt = _event_queue.get()                             # blocks for at least one event
         except Exception:
             log.exception("event queue read failed")
             continue
         if evt is None:                                          # sentinel from stop()
             return
+
+        events = [evt]
+        # Pull anything else already queued without waiting. Caps the burst
+        # cost at "however much arrived during the previous pass".
+        while True:
+            try:
+                e = _event_queue.get_nowait()
+            except queue.Empty:
+                break
+            if e is None:                                        # process this pass, then exit
+                stop = True
+                break
+            events.append(e)
+
         try:
-            pending_ms = unix_now_ms() - evt["ts_ms"]
-            log.info("process %s: cl_ord_id=%s symbol=%s pending=%dms",
-                     evt["kind"], evt["cl_ord_id"], evt.get("symbol", ""), pending_ms)
-            if evt["kind"] == "status":
-                _process_status(evt)
-            else:
-                _process_execrpt(evt)
+            _process_drained(events)
         except Exception:
-            log.exception("event processor failed: %r", evt)
+            log.exception("drain pass failed: n=%d", len(events))
 
 
-def _process_status(evt: dict) -> None:
+def _process_drained(events: list[dict]) -> None:
+    """Group N events by batch_id (resolved via clord_index), write each group
+    through one `drain_session`. Foreign / orphaned events are warned + dropped.
+    """
+    with state.batch_state_lock:
+        by_batch: dict[str, list[dict]] = {}
+        for evt in events:
+            try:
+                pending_ms = unix_now_ms() - evt["ts_ms"]
+                log.info("process %s: cl_ord_id=%s symbol=%s pending=%dms",
+                         evt["kind"], evt["cl_ord_id"], evt.get("symbol", ""), pending_ms)
+                resolved = _build_line(evt)
+                if resolved is None:
+                    continue
+                batch_id, payload = resolved
+                by_batch.setdefault(batch_id, []).append(payload)
+            except Exception:
+                log.exception("build event failed: %r", evt)
+
+        for batch_id, lines in by_batch.items():
+            try:
+                with order_log.drain_session(batch_id) as session:
+                    if session is None:
+                        for ln in lines:
+                            log.warning("no record for batch_id=%s; dropping event=%s",
+                                        batch_id, ln.get("event"))
+                        continue
+                    for ln in lines:
+                        session.append(ln)
+            except Exception:
+                log.exception("drain write failed: batch=%s n=%d", batch_id, len(lines))
+
+
+def _build_line(evt: dict) -> "tuple[str, dict] | None":
+    """Resolve cl_ord_id → batch_id and shape the on-disk JSONL payload. Caller
+    holds `batch_state_lock`. Returns None for foreign cl_ord_ids (warned)."""
+    if evt["kind"] == "status":
+        return _build_status_line(evt)
+    return _build_execrpt_line(evt)
+
+
+def _build_status_line(evt: dict) -> "tuple[str, dict] | None":
     cl_ord_id   = evt["cl_ord_id"]
     status      = evt["status"]
     status_text = _STATUS_TEXTS.get(status, f"Status{status}")
@@ -160,62 +223,61 @@ def _process_status(evt: dict) -> None:
         rej_fields["ord_rej_reason_text"]   = _REJ_REASON_TEXTS.get(reason, f"Reason{reason}")
         rej_fields["ord_rej_reason_detail"] = evt["ord_rej_reason_detail"]
 
-    with state.batch_state_lock:
-        batch_id = order_log.clord_index.get(cl_ord_id)
-        if batch_id is None:
-            extra = (f" reason={rej_fields['ord_rej_reason']} ({rej_fields['ord_rej_reason_text']}) "
-                     f"detail={rej_fields['ord_rej_reason_detail']!r}") if rej_fields else ""
-            log.warning("status for foreign cl_ord_id=%s symbol=%s status=%d (%s)%s; dropping",
-                        cl_ord_id, symbol, status, status_text, extra)
-            return
-        order_log.append(batch_id, {
-            "ts_ms":         evt["ts_ms"],
-            "event":         "status",
-            "cl_ord_id":     cl_ord_id,
-            "symbol":        symbol,
-            "status":        status,
-            "status_text":   status_text,
-            "filled_volume": evt["filled_volume"],
-            **rej_fields,
-        })
+    batch_id = order_log.clord_index.get(cl_ord_id)
+    if batch_id is None:
+        extra = (f" reason={rej_fields['ord_rej_reason']} ({rej_fields['ord_rej_reason_text']}) "
+                 f"detail={rej_fields['ord_rej_reason_detail']!r}") if rej_fields else ""
+        log.warning("status for foreign cl_ord_id=%s symbol=%s status=%d (%s)%s; dropping",
+                    cl_ord_id, symbol, status, status_text, extra)
+        return None
+
+    return batch_id, {
+        "ts_ms":         evt["ts_ms"],
+        "event":         "status",
+        "cl_ord_id":     cl_ord_id,
+        "symbol":        symbol,
+        "status":        status,
+        "status_text":   status_text,
+        "filled_volume": evt["filled_volume"],
+        **rej_fields,
+    }
 
 
-def _process_execrpt(evt: dict) -> None:
+def _build_execrpt_line(evt: dict) -> "tuple[str, dict] | None":
     cl_ord_id = evt["cl_ord_id"]
     exec_type = evt["exec_type"]
     symbol    = evt["symbol"]
 
-    with state.batch_state_lock:
-        batch_id = order_log.clord_index.get(cl_ord_id)
-        if batch_id is None:
-            log.warning("execrpt for foreign cl_ord_id=%s symbol=%s exec_type=%d (%s); dropping",
-                        cl_ord_id, symbol, exec_type, _exec_type_text(exec_type))
-            return
+    batch_id = order_log.clord_index.get(cl_ord_id)
+    if batch_id is None:
+        log.warning("execrpt for foreign cl_ord_id=%s symbol=%s exec_type=%d (%s); dropping",
+                    cl_ord_id, symbol, exec_type, _exec_type_text(exec_type))
+        return None
 
-        ev: dict = {
-            "ts_ms":           evt["ts_ms"],
-            "event":           "trade",
-            "cl_ord_id":       cl_ord_id,
-            "broker_order_id": evt["broker_order_id"],
-            "exec_id":         evt["exec_id"],
-            "exec_type":       exec_type,
-            "exec_type_text":  _exec_type_text(exec_type),
-            "symbol":          symbol,
-            "broker_ts_ms":    evt["broker_ts_ms"],
-        }
-        if exec_type == ExecType_Trade:
-            side = evt["side"]
-            ev["side"]      = side
-            ev["side_text"] = "buy" if side == OrderSide_Buy else "sell"
-            ev["volume"]    = evt["volume"]
-            ev["price"]     = evt["price"]
-            ev["amount"]    = evt["amount"]
-        elif exec_type == ExecType_CancelRejected:
-            reason = evt["ord_rej_reason"]
-            ev["ord_rej_reason"]        = reason
-            ev["ord_rej_reason_text"]   = _REJ_REASON_TEXTS.get(reason, f"Reason{reason}")
-            ev["ord_rej_reason_detail"] = evt["ord_rej_reason_detail"]
-        order_log.append(batch_id, ev)
+    ev: dict = {
+        "ts_ms":           evt["ts_ms"],
+        "event":           "trade",
+        "cl_ord_id":       cl_ord_id,
+        "broker_order_id": evt["broker_order_id"],
+        "exec_id":         evt["exec_id"],
+        "exec_type":       exec_type,
+        "exec_type_text":  _exec_type_text(exec_type),
+        "symbol":          symbol,
+        "broker_ts_ms":    evt["broker_ts_ms"],
+    }
+    if exec_type == ExecType_Trade:
+        side = evt["side"]
+        ev["side"]      = side
+        ev["side_text"] = "buy" if side == OrderSide_Buy else "sell"
+        ev["volume"]    = evt["volume"]
+        ev["price"]     = evt["price"]
+        ev["amount"]    = evt["amount"]
+    elif exec_type == ExecType_CancelRejected:
+        reason = evt["ord_rej_reason"]
+        ev["ord_rej_reason"]        = reason
+        ev["ord_rej_reason_text"]   = _REJ_REASON_TEXTS.get(reason, f"Reason{reason}")
+        ev["ord_rej_reason_detail"] = evt["ord_rej_reason_detail"]
+    return batch_id, ev
 
 
 def start() -> threading.Thread:
