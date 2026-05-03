@@ -40,6 +40,12 @@ GIT_LOCAL_DIR: Path  = Path(os.environ.get("GMX_GIT_LOCAL_DIR", "./git_orders"))
 GIT_BRANCH: str      = os.environ.get("GMX_GIT_BRANCH", "main")
 GIT_PULL_SECONDS: int = int(os.environ.get("GMX_GIT_PULL_SECONDS", "30"))
 
+# ── local logging ─────────────────────────────────────────────────────
+LOG_DIR: Path = Path(os.environ.get("GMX_LOG_DIR", "./logs")).resolve()
+LOG_FILE: str = os.environ.get("GMX_LOG_FILE", "gm-executor.log")
+LOG_MAX_BYTES: int = int(os.environ.get("GMX_LOG_MAX_BYTES", str(10 * 1024 * 1024)))
+LOG_BACKUP_COUNT: int = int(os.environ.get("GMX_LOG_BACKUP_COUNT", "10"))
+
 # ── remote logging ────────────────────────────────────────────────────
 FEISHU_WEBHOOKS: list[str] = [
     u.strip() for u in os.environ.get("GMX_FEISHU_WEBHOOKS", "").split(",") if u.strip()

@@ -9,13 +9,17 @@ Run with:
     python -m file_executor.main
 
 Required env: `GM_TOKEN`. Optional: `GMX_ORDERS_DIR`, `GMX_POLL_SECONDS`,
-`GMX_GIT_REPO_URL`, `GMX_GIT_LOCAL_DIR`, `GMX_GIT_BRANCH`, `GMX_FEISHU_WEBHOOKS`. See coding-style.md
-and the docs under `file_executor/docs/` for the full surface.
+`GMX_GIT_REPO_URL`, `GMX_GIT_LOCAL_DIR`, `GMX_GIT_BRANCH`, `GMX_LOG_DIR`,
+`GMX_LOG_FILE`, `GMX_LOG_MAX_BYTES`, `GMX_LOG_BACKUP_COUNT`,
+`GMX_FEISHU_WEBHOOKS`. See coding-style.md and the docs under
+`file_executor/docs/` for the full surface.
 """
 
 import logging
 import os
 import sys
+from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
+from queue import SimpleQueue
 
 from gm.api import MODE_LIVE, run, set_token, stop, timer
 
@@ -35,15 +39,58 @@ on_error                    = _cb.on_error
 
 
 log = logging.getLogger("file_executor")
+_local_log_listener: QueueListener | None = None
+_local_log_handlers: list[logging.Handler] = []
 
 
 def _setup_local_logging() -> None:
+    global _local_log_handlers, _local_log_listener
+
+    _stop_local_logging()
+
     fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter(fmt))
+    formatter = logging.Formatter(fmt)
+
+    console = logging.StreamHandler(sys.stderr)
+    console.setLevel(logging.INFO)
+    console.setFormatter(formatter)
+
+    config.LOG_DIR.mkdir(parents=True, exist_ok=True)
+    file_handler = RotatingFileHandler(
+        config.LOG_DIR / config.LOG_FILE,
+        maxBytes=config.LOG_MAX_BYTES,
+        backupCount=config.LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+
+    q = SimpleQueue()
+    queue_handler = QueueHandler(q)
+    queue_handler.setLevel(logging.INFO)
+
     root = logging.getLogger()
+    for old_handler in root.handlers[:]:
+        root.removeHandler(old_handler)
     root.setLevel(logging.INFO)
-    root.addHandler(handler)
+    root.addHandler(queue_handler)
+
+    _local_log_listener = QueueListener(
+        q, console, file_handler, respect_handler_level=True,
+    )
+    _local_log_handlers = [console, file_handler]
+    _local_log_listener.start()
+
+
+def _stop_local_logging() -> None:
+    global _local_log_handlers, _local_log_listener
+    if _local_log_listener is None:
+        return
+    _local_log_listener.stop()
+    _local_log_listener = None
+    for handler in _local_log_handlers:
+        handler.close()
+    _local_log_handlers = []
 
 
 def init(context) -> None:
@@ -115,6 +162,8 @@ def _shutdown() -> None:
         stop()
     except Exception:
         log.exception("gm.stop() failed")
+    finally:
+        _stop_local_logging()
 
 
 if __name__ == "__main__":
