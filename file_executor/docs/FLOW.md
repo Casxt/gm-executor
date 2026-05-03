@@ -97,7 +97,7 @@ The split decouples SDK dispatch from our locks. Events delivered while a cycle 
 
 ## Locks
 
-* `log_lock` — serialises **writes** to any `order_record.jsonl`. Brief: open → write → fsync → close.
+* `log_lock` — serialises **writes** to any `order_record.jsonl`. Brief: open → write → close (no flush, no fsync).
 * `batch_state_lock` — serialises **everything that observes or changes which directory a batch lives in**: cross-dir moves, path lookups, the connector's `is_terminal`+`atomic_copy`, the entire `run_cycle`, and every drained callback event. Reentrant — the cycle re-acquires it via `order_log` helpers.
 * Lock order: `batch_state_lock` then `log_lock`. Never reverse.
 

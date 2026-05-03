@@ -11,8 +11,9 @@ Concurrency rules from FLOW.md:
   the `callback-processor` daemon (also under `batch_state_lock`). Events delivered during a cycle
   sit in the SDK→drain queue until the cycle releases the lock, so the drain always observes a
   fully-committed `clord_index`. No race, no dropped events for our own orders.
-* No `os.fsync`: broker is source of truth, log is audit. Windows + AV makes fsync
-  multi-second and serialises the cycle. Crash loses ≤1 line; power-cut a few.
+* No `os.fsync` and no explicit `flush`: broker is source of truth, log is audit.
+  `close()` flushes Python's buffer to the OS, so a crash never loses an already-
+  written line; we just skip the redundant kernel hop. Power-cut may lose a few.
 * `batch_state_lock` is reentrant: the cycle worker holds it across the entire
   `run_cycle`, then re-enters here via `append` / `replay_record` / `move_pair`.
 """
@@ -91,15 +92,13 @@ def append(batch_id: str, event: dict[str, Any]) -> None:
                 t_open = time.perf_counter()
                 f.write(line)
                 t_write = time.perf_counter()
-                f.flush()                                        # no fsync — see ORDER_RECORD.md
-                t_flush = time.perf_counter()
             t_close = time.perf_counter()
     t_done = time.perf_counter()
 
     total_ms = (t_done - t0) * 1000
     if total_ms > _APPEND_SLOW_MS:
         log.info("append slow: total=%.1fms batch=%s | bsl=%.1f locate=%.1f setup=%.1f "
-                 "loglock=%.1f open=%.1f write=%.1f flush=%.1f close=%.1f release=%.1f",
+                 "loglock=%.1f open=%.1f write=%.1f close=%.1f release=%.1f",
                  total_ms, batch_id,
                  (t_bsl     - t0)        * 1000,
                  (t_locate  - t_bsl)     * 1000,
@@ -107,8 +106,7 @@ def append(batch_id: str, event: dict[str, Any]) -> None:
                  (t_loglock - t_setup)   * 1000,
                  (t_open    - t_loglock) * 1000,
                  (t_write   - t_open)    * 1000,
-                 (t_flush   - t_write)   * 1000,
-                 (t_close   - t_flush)   * 1000,
+                 (t_close   - t_write)   * 1000,
                  (t_done    - t_close)   * 1000)
 
 
