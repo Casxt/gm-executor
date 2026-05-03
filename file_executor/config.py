@@ -56,38 +56,56 @@ def ensure_dirs() -> None:
 
 
 def bench_disk() -> None:
-    """One-shot disk smoke test on PENDING_DIR. Logged at INFO so AV/path issues
-    show up at startup instead of surprising us mid-cycle.
+    """One-shot disk smoke test, mimicking the cycle's real workload: fresh files
+    (cold AV scan path), not overwrites (warm cache).
 
-    Each measurement is the median of N tries — single samples on Windows + AV
-    are too noisy (first hit often 100x the steady-state cost).
+    Reports median AND max — AV bursts on cold writes, so a fast median with a
+    multi-second max is the actual signature of the slowness we hit at runtime.
     """
     log = logging.getLogger("file_executor.bench")
-    probe = PENDING_DIR / ".bench_probe"
     payload = ("x" * 200 + "\n") * 5                    # ~1 KB, 5 lines
+    n = 8
 
-    def _med(fn, n: int = 5) -> float:
-        samples = []
-        for _ in range(n):
-            t0 = time.perf_counter()
-            fn()
-            samples.append((time.perf_counter() - t0) * 1000)
-        samples.sort()
-        return samples[len(samples) // 2]
+    def _stats(samples: list[float]) -> tuple[float, float]:
+        s = sorted(samples)
+        return s[len(s) // 2], s[-1]                    # median, max
+
+    probes = [PENDING_DIR / f".bench_probe_{i}" for i in range(n)]
+    glob_samples: list[float] = []
+    create_samples: list[float] = []                    # open("w") + write + flush + close — first-touch
+    append_samples: list[float] = []                    # open("a") + write + flush + close — second touch
+    read_samples: list[float] = []                      # open("r") + read
 
     try:
-        glob_ms = _med(lambda: list(PENDING_DIR.glob("*.json")))
-        def _write():
-            with open(probe, "w", encoding="utf-8") as f: f.write(payload); f.flush()
-        write_ms = _med(_write)
-        def _read():
-            with open(probe, "r", encoding="utf-8") as f: f.read()
-        read_ms = _med(_read)
-        log.info("disk_bench: pending/ glob=%.1fms write=%.1fms read=%.1fms (median of 5; "
-                 "expect <5ms each — sustained >100ms ⇒ AV/cloud-sync hooking the path)",
-                 glob_ms, write_ms, read_ms)
+        for p in probes:
+            t0 = time.perf_counter()
+            list(PENDING_DIR.glob("*.json"))
+            glob_samples.append((time.perf_counter() - t0) * 1000)
+
+            t0 = time.perf_counter()
+            with open(p, "w", encoding="utf-8") as f: f.write(payload); f.flush()
+            create_samples.append((time.perf_counter() - t0) * 1000)
+
+            t0 = time.perf_counter()
+            with open(p, "a", encoding="utf-8") as f: f.write(payload); f.flush()
+            append_samples.append((time.perf_counter() - t0) * 1000)
+
+            t0 = time.perf_counter()
+            with open(p, "r", encoding="utf-8") as f: f.read()
+            read_samples.append((time.perf_counter() - t0) * 1000)
+
+        gm, gmax = _stats(glob_samples)
+        cm, cmax = _stats(create_samples)
+        am, amax = _stats(append_samples)
+        rm, rmax = _stats(read_samples)
+        log.info("disk_bench: pending/ (n=%d fresh files) "
+                 "glob med=%.1fms max=%.1fms | create med=%.1fms max=%.1fms | "
+                 "append med=%.1fms max=%.1fms | read med=%.1fms max=%.1fms "
+                 "(max >100ms ⇒ AV/cloud-sync hooking the path)",
+                 n, gm, gmax, cm, cmax, am, amax, rm, rmax)
     except Exception:
         log.exception("disk_bench failed")
     finally:
-        try: probe.unlink(missing_ok=True)
-        except Exception: pass
+        for p in probes:
+            try: p.unlink(missing_ok=True)
+            except Exception: pass
