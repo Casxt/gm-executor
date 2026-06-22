@@ -26,8 +26,8 @@ from gm.api import (
     order_volume,
 )
 
-from . import config, order_log, state
-from .models import BatchDoc
+from . import config, order_log, report, state
+from .models import BatchDoc, PositionView
 from .schema import parse_and_validate
 
 log = logging.getLogger(__name__)
@@ -91,7 +91,7 @@ def run_cycle() -> None:
         positions, unfinished = _broker_snapshot()
 
         with timed("pass_one") as f:
-            seen, active = _pass_one(now, unfinished)
+            seen, active = _pass_one(now, positions, unfinished)
             f["seen"] = len(seen); f["active"] = len(active)
         if _has_overlap(seen):
             return                                      # invariant broken; operator must intervene
@@ -108,6 +108,7 @@ def run_cycle() -> None:
             done = _matched(doc, positions, unfinished)
         if done:
             log.info("matched: %s -> finished/", doc.batch_id)
+            report.emit_and_notify(doc, positions, unfinished, outcome="matched")
             order_log.move_pair(doc.batch_id, config.FINISHED_DIR)
     finally:
         state.batch_state_lock.release()
@@ -116,7 +117,8 @@ def run_cycle() -> None:
 
 # ── pass 1: clean pending/ ────────────────────────────────────────────
 
-def _pass_one(now: int, unfinished: dict[str, list]) -> tuple[list[BatchDoc], list[BatchDoc]]:
+def _pass_one(now: int, positions: dict[tuple[str, int], PositionView],
+              unfinished: dict[str, list]) -> tuple[list[BatchDoc], list[BatchDoc]]:
     seen:   list[BatchDoc] = []
     active: list[BatchDoc] = []
     with timed("pass_one_glob") as f:
@@ -136,6 +138,7 @@ def _pass_one(now: int, unfinished: dict[str, list]) -> tuple[list[BatchDoc], li
         if now > doc.expires_at:
             log.info("expired: %s -> expired/", doc.batch_id)
             _cancel_alive(doc.batch_id, unfinished)
+            report.emit_and_notify(doc, positions, unfinished, outcome="expired")
             order_log.move_pair(doc.batch_id, config.EXPIRED_DIR)
             continue
 
@@ -169,8 +172,6 @@ def _reconcile(doc: BatchDoc, positions: dict, unfinished: dict[str, list]) -> N
     with timed("own_cl_ord_ids") as f:
         own_cl_ord_ids = _own_cl_ord_ids(doc.batch_id)
         f["batch"] = doc.batch_id; f["n"] = len(own_cl_ord_ids)
-    long_side = int(PositionSide_Long)
-
     # One open fd for all submit-line appends in this cycle. Lazy: opens on
     # first write, so a no-op cycle pays zero file-IO. Saves ~1010ms × N
     # bucket waits on the throttled cloud disk vs. open/close-per-append.
@@ -184,16 +185,53 @@ def _reconcile(doc: BatchDoc, positions: dict, unfinished: dict[str, list]) -> N
                         _handle_unfinished(order.symbol, sym_unfinished, own_cl_ord_ids)
                         continue
 
-                    held = positions.get((order.symbol, long_side), 0)
-                    diff = order.target - held
+                    pv = _pos(positions, order.symbol, PositionSide_Long)
+                    diff = order.target - pv.volume
                     if diff == 0:
                         continue
 
-                    _submit(session, doc.batch_id, order.id, order.symbol, diff,
+                    submit_diff = _cap_sell(session, doc.batch_id, order, diff, pv)
+                    if submit_diff == 0:
+                        continue
+
+                    _submit(session, doc.batch_id, order.id, order.symbol, submit_diff,
                             order.order_type, order.price)
             except Exception:
                 log.exception("reconcile failed for %s/%s; will retry next cycle",
                               doc.batch_id, order.id)
+
+
+def _cap_sell(session: "order_log._Session", batch_id: str, order, diff: int,
+              pv: PositionView) -> int:
+    """Clamp a sell to broker-available volume. Returns the diff to actually submit
+    (0 ⇒ submit nothing). Buys pass through unchanged.
+
+    A-share T+1, unsettled corporate-action shares, and open-order freezes mean the
+    broker's sellable figure (`available`) can be well below total `volume`; sending
+    the full diff gets the whole order rejected (e.g. 603836: held=980, available=700).
+    When capped (incl. capped-to-zero for suspended / all-locked), log a WARNING — it
+    rides the Feishu relay and a `cap` line lands in the record for the close report.
+    """
+    if diff >= 0:
+        return diff                                              # buy: cash-bound, not our concern
+
+    want = -diff
+    submit_vol = min(want, pv.available)
+    if submit_vol < want:
+        log.warning("sell capped: batch=%s symbol=%s want=%d -> %d "
+                    "(held=%d available=%d)",
+                    batch_id, order.symbol, want, submit_vol, pv.volume, pv.available)
+        session.append({
+            "ts_ms":     unix_now_ms(),
+            "event":     "cap",
+            "order_id":  order.id,
+            "symbol":    order.symbol,
+            "want":      want,
+            "submitted": submit_vol,
+            "held":      pv.volume,
+            "available": pv.available,
+        })
+    return -submit_vol
 
 
 def _handle_unfinished(symbol: str, sym_unfinished: list, own_cl_ord_ids: set[str]) -> None:
@@ -272,10 +310,9 @@ def _submit(session: "order_log._Session",
 # ── matched ───────────────────────────────────────────────────────────
 
 def _matched(doc: BatchDoc, positions: dict, unfinished: dict[str, list]) -> bool:
-    long_side = int(PositionSide_Long)
     own_cl_ord_ids = _own_cl_ord_ids(doc.batch_id)
     for order in doc.orders:
-        if positions.get((order.symbol, long_side), 0) != order.target:
+        if _pos(positions, order.symbol, PositionSide_Long).volume != order.target:
             return False
         for o in unfinished.get(order.symbol, []):
             if o.cl_ord_id in own_cl_ord_ids:
@@ -314,14 +351,19 @@ def _cancel_alive(batch_id: str, unfinished: dict[str, list]) -> None:
 
 # ── shared bits ───────────────────────────────────────────────────────
 
-def _broker_snapshot() -> tuple[dict[tuple[str, int], int], dict[str, list]]:
+def _broker_snapshot() -> tuple[dict[tuple[str, int], PositionView], dict[str, list]]:
     with timed("get_position") as f:
         raw_positions = get_position() or []
         f["n"] = len(raw_positions)
 
-    positions: dict[tuple[str, int], int] = {}
+    # `get_position()` returns DictLikeObject (dict subclass, attr access) built with
+    # including_default_value_fields=True, so `available` is always present (0 if unset).
+    positions: dict[tuple[str, int], PositionView] = {}
     for p in raw_positions:
-        positions[(p.symbol, int(p.side))] = int(p.volume)
+        positions[(p.symbol, int(p.side))] = PositionView(
+            volume=int(p.volume),
+            available=int(getattr(p, "available", 0) or 0),
+        )
 
     with timed("get_unfinished_orders") as f:
         raw_unfinished = get_unfinished_orders() or []
@@ -331,6 +373,10 @@ def _broker_snapshot() -> tuple[dict[tuple[str, int], int], dict[str, list]]:
     for o in raw_unfinished:
         unfinished[o.symbol].append(o)
     return positions, unfinished
+
+
+def _pos(positions: dict[tuple[str, int], PositionView], symbol: str, side) -> PositionView:
+    return positions.get((symbol, int(side)), PositionView(0, 0))
 
 
 def _own_cl_ord_ids(batch_id: str) -> set[str]:

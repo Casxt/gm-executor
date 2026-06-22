@@ -44,13 +44,51 @@ Per order, exactly one branch — **never cancel-and-resubmit, just wait**:
 
 | `unfinished[symbol]`    | action                                                                     |
 | ----------------------- | -------------------------------------------------------------------------- |
-| empty                   | submit `target − held` if non-zero; else done                              |
+| empty                   | submit `target − held` if non-zero (sells capped to `available`); else done |
 | all `cl_ord_id`s ours   | log info + skip; per stuck entry (`age > 600s`), log error                 |
 | any `cl_ord_id` foreign | log error + skip; operator must intervene                                  |
 
 Submit is fire-and-forget. The cycle never cancels — `cancel` events come only from pass-1 expiry.
 
+**Sell cap (`_cap_sell`)**: `held` comes from `Position.volume` (total), but a sell can
+only ever execute up to `Position.available` (sellable now: net of A-share T+1 lock,
+unsettled corporate-action shares, and open-order freezes). So a reduce (`diff < 0`) is
+clamped to `submit = min(target−held, available)`. When clamped — including clamped to
+zero (suspended / fully locked / unsettled) — we log a WARNING (it rides the Feishu relay)
+and append a `cap` line to the record. Buys pass through unchanged (cash-bound, the broker
+rejects over-buys). A capped batch may never reach `matched`; it ages out to `expired/`
+and the close report flags the residual. This fixes the 980-vs-700 reject loop
+(see GM_SDK.md → `Position` fields).
+
 `matched(doc, positions, unfinished)` is true iff every order's held volume equals its target AND no `cl_ord_id` in `unfinished[symbol]` belongs to this batch. Foreign orders don't block matched.
+
+## Close report
+
+When a batch reaches a terminal cycle — **matched** (→ `finished/`) or **expired**
+(→ `expired/`) — `report.emit_and_notify(doc, positions, unfinished, outcome)` fires
+**before** the `move_pair`. It builds a `BatchReport` (one row per order: target / held /
+available / diff / live-own / foreign / capped / reason_hint), highlighting any **unaligned**
+position (held ≠ target) so an operator can triage at a glance:
+
+| reason_hint        | trigger                                                            |
+| ------------------ | ----------------------------------------------------------------- |
+| under-sellable     | `held > target` and (`capped` or `available < shortfall`) — 603836 |
+| foreign-order      | a non-ours unfinished order occupies the symbol                   |
+| never-filled       | our order is still on the book, never traded — suspended/illiquid (603137) |
+| residual-mismatch  | any other held ≠ target                                           |
+
+Two design rules make this safe under back-to-back batches:
+
+1. **No fresh broker read.** The report reuses the `positions` / `unfinished` snapshot the
+   cycle already took at its start (cycle.py). That snapshot *is* the batch's terminal
+   truth — the overlap invariant + single cycle worker mean only one batch is active per
+   cycle, so consecutive batches never share a snapshot. A fresh `get_position()` here would
+   be slow on the throttled disk and could observe a *later* batch's moves.
+2. **Non-blocking, never-raising delivery.** The report goes out through `notify.notify()`,
+   an abstract `Notifier` interface (default `LoggingNotifier`: WARNING when unaligned so it
+   rides Feishu, INFO when clean). A real channel (Discord, …) implements the same interface
+   and must push network I/O onto a queue/subprocess — see [REMOTE_LOGGING.md](./REMOTE_LOGGING.md).
+   `emit_and_notify` swallows every exception; a report failure never disturbs trading.
 
 ## Threads
 

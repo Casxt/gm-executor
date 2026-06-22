@@ -145,10 +145,47 @@ We never see other `ExecType` values in practice for our workflow.
 
 | function                       | returns                                | used in                            |
 | ------------------------------ | -------------------------------------- | ---------------------------------- |
-| `get_position(symbol, side)` | one position record or `None`        | plan phase                         |
-| `get_positions()`            | all current positions                  | plan phase (cached once per cycle) |
-| `get_unfinished_orders()`    | currently active (non-terminal) orders | diagnostics only                   |
+| `get_position()`             | **list** of all current positions      | cycle snapshot (once per cycle)    |
+| `get_unfinished_orders()`    | currently active (non-terminal) orders | cycle snapshot                     |
 | `get_orders()`               | all orders for the day                 | diagnostics                        |
+
+### `get_position()` — what it actually returns
+
+We call the **no-arg** `gm.api.get_position()` (not the `get_position(symbol, side)`
+form the upstream docs describe). It returns a **`list`** — one entry per held symbol,
+empty list when flat. Each entry is a **`DictLikeObject`** (a `dict` subclass with
+attribute access, `gm/utils.py`), built via `protobuf_to_dict(..., including_default_value_fields=True)`,
+so **every field is always present** (defaulting to `0`/`""`) — reading `p.available`
+never raises `AttributeError` even when the broker omits it.
+
+During a trade-channel gap `get_position()` may return an **empty list** (not raise);
+acting on empty would diff every target against 0 and dump the book — hence the
+`trade_channel_up` guard + reconnect grace in `run_cycle`.
+
+### `Position` fields we read
+
+35 fields total; the ones the cycle uses:
+
+| field                | meaning                                                                       |
+| -------------------- | ----------------------------------------------------------------------------- |
+| `symbol`             | `EXCHANGE.CODE`                                                               |
+| `side`               | `PositionSide_Long = 1` / `_Short = 2`; A-shares are always Long              |
+| `volume`             | **total** holding (settled + unsettled). Drives `diff = target − volume`      |
+| `available`          | **currently sellable / closeable** — already net of A-share T+1 lock, unsettled corporate-action shares, and open-order freezes. **Sells are capped to this.** |
+
+Other position fields exist but we don't read them: `volume_today` (今仓), `available_today`
+(今仓可用), `available_now` (实时可平), `order_frozen`/`order_frozen_today` (挂单冻结),
+`vwap`/`fpnl`/`market_value`/etc. (P&L). If a broker turns out to populate `available_now`
+rather than `available` as the live sellable figure, the close report (which prints both
+`held` and `available`) makes that visible and only `_broker_snapshot` needs the swap.
+
+> **Why `available` matters (2026-06-22 incident):** 603836 did a 10→4 bonus issue, so
+> `volume` reported 980 (700 settled + 280 not-yet-arrived). Diffing against `volume`
+> submitted a sell for 980, which the broker rejected (only 700 sellable) — and since the
+> position never changed, the cycle resubmitted 980 every tick in a reject loop until
+> expiry. Capping the sell to `available` (700) is the fix. Note a **suspended** symbol
+> (603137, 停牌) has full `available` but still never fills — that case can't be fixed at
+> submit time and is surfaced by the close report instead.
 
 ## Callbacks (registered, kept tiny)
 

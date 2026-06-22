@@ -1,6 +1,6 @@
 # Order Record (per-batch log)
 
-Per-batch append-only **JSONL** log: `<batch_id>.order_record.jsonl`, kept next to `<batch_id>.json`. Two writers append to it: the **cycle worker** (`submit`, `cancel`) and the **callback-processor** drain (`status`, `trade`). Never edited, truncated, or rotated.
+Per-batch append-only **JSONL** log: `<batch_id>.order_record.jsonl`, kept next to `<batch_id>.json`. Two writers append to it: the **cycle worker** (`submit`, `cancel`, `cap`) and the **callback-processor** drain (`status`, `trade`). Never edited, truncated, or rotated.
 
 The log is the **only** persistent state the executor keeps. There is no separate ledger / state.json. The broker (via `get_unfinished_orders()` and `get_position()`) is the source of *current* truth; the log is the source of *historical* truth and the **only** place `order_id ↔ cl_ord_id` is recorded.
 
@@ -44,6 +44,19 @@ This is the only line that anchors `order_id ↔ cl_ord_id`. Without it, no othe
 ```
 
 Records *intent*. Broker accepts ⇒ a `status` line with `Canceled` arrives later; refuses ⇒ a `trade` line with `exec_type=19` arrives.
+
+### `cap` — cycle worker, when a sell is clamped to `available`
+
+```jsonc
+{"ts_ms":1745996400500,"event":"cap","order_id":"o1","symbol":"SHSE.603836",
+ "want":980,"submitted":700,"held":980,"available":700}
+```
+
+Records that a reduce was clamped: we wanted to sell `want` but only `submitted` was
+sellable (`available`), because `held` includes T+1-locked / unsettled / order-frozen
+shares. `submitted == 0` means nothing was sent (suspended / fully locked). The close
+report reads these lines to flag `capped` orders (`report.py`); diagnostic only — the
+cycle never reads them back for control flow.
 
 ### `status` — drain, from `on_order_status`
 
